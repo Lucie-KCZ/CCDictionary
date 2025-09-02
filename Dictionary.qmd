@@ -1,0 +1,2206 @@
+---
+title: "Indicator Dictionary"
+format:
+  html:
+    toc: true
+    number-sections: false
+execute:
+  echo: false
+  warning: false
+  message: false
+---
+
+```{r setup_general}
+# General setup - packages, plotting defaults, palette
+if (!requireNamespace("readxl", quietly = TRUE)) install.packages("readxl")
+if (!requireNamespace("VennDiagram", quietly = TRUE)) install.packages("VennDiagram")
+
+library(readxl)
+library(VennDiagram)
+library(grid)
+library(grDevices)
+
+# Roomy plots so long labels don't clip
+knitr::opts_chunk$set(fig.width = 10, fig.height = 8, out.width = "100%", dpi = 96)
+
+# Plot text sizes
+cex_main  <- 0.95
+cex_lab   <- 0.9
+cex_axis  <- 0.85
+cex_names <- 0.75
+
+# Core colours used through the a1c181
+pal_framework4 <- c("#264653", "#ffbe0b", "#f77f00", "#a1c181") #  for Venns / small bars
+pal_dtype4     <- c("#264653", "#ffbe0b", "#f77f00", "#a1c181") #  for Data Type small multiples
+heat_col_start <- "#f4f1de"
+heat_col_end   <- "#5f0f40"
+
+# Topic palette - USER area
+
+# Set topic_palette_mode to "user" to enforce the colours you list in topic_palette_user;
+# set to "auto" to let the script generate a palette.
+topic_palette_mode <- "user"  #  "user" or "auto"
+
+# Define your preferred colours here. The *names* must match the Topic values exactly.
+# Add/remove lines as needed. Any topics not listed here will fall back to auto colours.
+topic_palette_user <- c(
+  "Impacts"       = "#264653",
+  "Vulnerability" = "#619b8a",
+  "Adaptation"    = "#a1c181",
+  "Mitigation"    = "#ffbe0b",
+  "Drivers"       = "#f77f00"
+)
+
+col_priority <- c("#264653", "#619b8a", "#a8dadc", "#ffee9d", "#ffbe0b", "#f77f00")  # Completeness, Source, Obligation, Divisions
+
+```
+
+```{r setup_functions}
+# Helper functions shared across the document
+
+# --- Text & formatting helpers ---
+fmt_int <- function(x) format(as.integer(x), big.mark = ",", trim = TRUE)
+fmt_pct <- function(num, den) ifelse(den > 0, paste0(round(100 * num / den), "%"), "n/a")
+
+# Truncate long labels
+ds_trunc <- function(x, n = 32){
+  ifelse(nchar(x) > n, paste0(substr(x, 1, n-1), "…"), x)
+}
+
+# Title case with acronym preservation
+.ds_acronyms <- c("spc","sprep","un","undp","undrr","unfccc","ipcc","fao","imf","oecd","ilo","who","wmo",
+                  "wb","wbg","adb","esa","nasa","sdg","unep","unsd","unescap","unicef","faostat")
+ds_titlecase <- function(x){
+  if (is.na(x) || !nzchar(x)) return(x)
+  words <- strsplit(x, " ")[[1]]
+  small <- c("and","or","of","the","a","an","to","for","in","on","by","with","at","from","vs","per","de")
+  up_word <- function(w){
+    lw <- tolower(w)
+    if (lw %in% .ds_acronyms) return(toupper(lw))
+    parts <- strsplit(lw, "-")[[1]]
+    parts <- sapply(parts, function(p){
+      if (nchar(p) == 0) return(p)
+      paste0(toupper(substr(p,1,1)), substr(p,2,nchar(p)))
+    }, USE.NAMES = FALSE)
+    paste(parts, collapse = "-")
+  }
+  out <- character(length(words))
+  for (i in seq_along(words)){
+    w <- words[i]
+    if (i > 1 && tolower(w) %in% small) out[i] <- tolower(w) else out[i] <- up_word(w)
+  }
+  paste(out, collapse = " ")
+}
+
+# Normalise free text
+ds_norm <- function(x){
+  x <- tolower(trimws(x))
+  x <- gsub("[[:space:]]+", " ", x)
+  x <- gsub("[[:punct:]]+$", "", x)
+  x
+}
+
+# Split multi-value cells
+ds_split_multi <- function(x){
+  if (is.na(x) || !nzchar(x)) return(character(0))
+  x0 <- tolower(x)
+  x0 <- gsub("\r|\n", " ", x0)
+  x0 <- gsub("\\band\\b", ";", x0)
+  x0 <- gsub("&|\u2013|\u2014|\u2010|\u2212", ";", x0)
+  parts <- unlist(strsplit(x0, "[;,/|]+"))
+  parts <- ds_norm(parts)
+  parts[nzchar(parts)]
+}
+
+# Pick first column matching any regex pattern
+ds_pick_col <- function(nm, patterns){
+  for (pt in patterns){
+    idx <- which(grepl(pt, nm, ignore.case = TRUE))[1]
+    if (!is.na(idx)) return(nm[idx])
+  }
+  NA_character_
+}
+
+# Colour blending + subpalette used for subtopics
+blend_col <- function(col1, col2 = "#FFFFFF", p = 0.5){
+  c1 <- col2rgb(col1)/255; c2 <- col2rgb(col2)/255
+  mix <- c1 * (1 - p) + c2 * p
+  rgb(mix[1], mix[2], mix[3])
+}
+subpalette <- function(base_col, n){
+  light <- blend_col(base_col, "#FFFFFF", p = 0.6)
+  dark  <- blend_col(base_col, "#000000", p = 0.4)
+  grDevices::colorRampPalette(c(light, base_col, dark))(n)
+}
+
+# Build a topic palette given the set of topics seen in the data.
+# mode = "user": use user-specified colours where provided, auto-generate for the rest.
+# mode = "auto": ignore user map and auto-generate for all topics.
+build_topic_palette <- function(topics, user_map, mode = c("user","auto")){
+  mode <- match.arg(mode)
+  topics <- as.character(topics)
+  topics <- topics[!is.na(topics) & nzchar(topics)]
+  topics <- unique(topics)
+  if (!length(topics)) return(character(0))
+  #  Auto colours
+  auto_cols <- try(hcl.colors(length(topics), "Set 3"), silent = TRUE)
+  if (inherits(auto_cols, "try-error")) auto_cols <- try(hcl.colors(length(topics), "Set 2"), silent = TRUE)
+  if (inherits(auto_cols, "try-error")) auto_cols <- grDevices::rainbow(length(topics))
+  names(auto_cols) <- topics
+  if (mode == "auto" || is.null(user_map) || !length(user_map)) return(auto_cols)
+  #  Merge: user overrides where names match; others keep auto
+  out <- auto_cols
+  m <- intersect(names(user_map), topics)
+  out[m] <- user_map[m]
+  out
+}
+
+# --- Framework parsing helpers ---
+non_empty <- function(x){
+  x0 <- ifelse(is.na(x), "", as.character(x))
+  grepl("\\S", x0)
+}
+is_code_like <- function(x){
+  x0 <- tolower(trimws(ifelse(is.na(x), "", as.character(x))))
+  has_digit <- grepl("[0-9]", x0)
+  looks_coded <- grepl("\\b([a-z]?-?[0-9]+([\\.-][a-z0-9]+)*)\\b", x0)
+  not_qualifiers <- !grepl("\\b(related|similar|part of|see also)\\b", x0)
+  has_digit & looks_coded & not_qualifiers
+}
+
+# --- Overlap heatmap utilities ---
+pairwise_overlap_matrix <- function(bin){
+  cn <- colnames(bin); p <- length(cn)
+  M <- matrix(NA_real_, nrow = p, ncol = p, dimnames = list(cn, cn))
+  for (i in seq_len(p)){
+    for (j in seq_len(p)){
+      if (i != j) M[i, j] <- sum(bin[, cn[i]] == 1 & bin[, cn[j]] == 1, na.rm = TRUE)
+    }
+  }
+  M
+}
+sort_overlap_matrix <- function(M, method = c("total", "cluster", "none")){
+  method <- match.arg(method)
+  if (nrow(M) < 2) return(M)
+  if (method == "none") return(M)
+  if (method == "total"){
+    o <- order(rowSums(M, na.rm = TRUE), decreasing = TRUE); M[o, o]
+  } else {
+    X <- M; X[is.na(X)] <- 0
+    d <- as.dist(max(X) - X)
+    o <- hclust(d, method = "average")$order
+    M[o, o]
+  }
+}
+plot_overlap_heatmap <- function(M, title = "Overlap heatmap", cex_axis = 0.75,
+                                 col_start = heat_col_start, col_end = heat_col_end, ncol = 100){
+  pal <- colorRampPalette(c(col_start, col_end))(ncol)
+  vals <- as.numeric(M); vals <- vals[is.finite(vals)]
+  zmin <- if (length(vals)) min(vals) else 0
+  zmax <- if (length(vals)) max(vals) else 1
+  if (zmax == zmin) zmax <- zmin + 1
+  breaks <- seq(zmin, zmax, length.out = ncol + 1)
+  
+  Mflip <- t(M)[, nrow(M):1, drop = FALSE]
+  
+  layout(matrix(c(1, 2), 1), widths = c(4.2, 0.6))
+  opar <- par(no.readonly = TRUE); on.exit({par(opar); layout(1)}, add = TRUE)
+  
+  left_mar <- min(max(8, nrow(M) * 0.6), 22)
+  par(mar = c(6, left_mar, 3, 1))
+  image(1:ncol(Mflip), 1:nrow(Mflip), Mflip,
+        col = pal, breaks = breaks, axes = FALSE, xlab = "", ylab = "", useRaster = TRUE)
+  axis(1, at = 1:ncol(Mflip), labels = colnames(M), las = 2, cex.axis = cex_axis)
+  axis(2, at = 1:nrow(Mflip), labels = rev(rownames(M)), las = 2, cex.axis = cex_axis)
+  box(); title(main = title, cex.main = 0.95)
+  
+  par(mar = c(6, 1, 3, 5))
+  zvals <- matrix(seq(zmin, zmax, length.out = ncol), nrow = 1)
+  image(x = 1, y = seq(zmin, zmax, length.out = ncol), z = zvals,
+        col = pal, breaks = breaks, axes = FALSE, xlab = "", ylab = "", useRaster = TRUE)
+  ticks <- base::pretty(c(zmin, zmax))
+  axis(4, at = ticks, labels = as.character(round(ticks)), las = 1, cex.axis = cex_axis)
+  mtext("Common indicators", side = 4, line = 3, cex = 0.85)
+}
+
+# Scale 0–1 from numeric or % strings
+scale01 <- function(x){
+  x <- suppressWarnings(as.numeric(gsub("%", "", x)))
+  x <- ifelse(is.na(x), NA_real_, x)
+  if (any(x > 1, na.rm = TRUE)) x <- x / 100
+  pmax(0, pmin(1, x))
+}
+```
+
+```{r load_data}
+# Load workbook and normalise column names
+path <- "C:/Users/luciek/OneDrive - SPC/Indicators/202508_dictionary.xlsx"
+ind <- read_excel(path, sheet = "Indicators")
+names(ind) <- tolower(gsub("\\s+", "_", gsub("[^A-Za-z0-9 ]", "", names(ind))))
+ind$completeness <- ind$completeness*100  # convert to %
+ind$spatial_completeness <- ind$spatial_completeness*100  # convert to %
+ind$temporal_completeness <- ind$temporal_completeness*100  # convert to %
+```
+
+```{r frameworks_prepare}
+# Frameworks of interest
+fw_cols <- c("cc_survey","sdg","sendai_framework","sprep","global_set","fdes","samoa_pathway","other_frameworks")
+fw_cols <- fw_cols[fw_cols %in% names(ind)]
+
+# Pretty labels
+fw_map <- c(
+  cc_survey        = "Climate change survey",
+  sdg              = "SDG",
+  sendai_framework = "Sendai Framework",
+  sprep            = "SPREP",
+  global_set       = "Global Set",
+  fdes             = "FDES",
+  samoa_pathway    = "SAMOA pathway",
+  other_frameworks = "Other frameworks"
+)
+fw_label <- function(x){ y <- fw_map[x]; y[is.na(y)] <- x[is.na(y)]; y }
+
+# Build strict/loose membership matrices
+fw_strict <- ind[, fw_cols, drop = FALSE]
+for (cn in fw_cols){
+  fw_strict[[cn]] <- ifelse(non_empty(fw_strict[[cn]]) & is_code_like(fw_strict[[cn]]), 1L, 0L)
+}
+fw_loose <- ind[, fw_cols, drop = FALSE]
+for (cn in fw_cols){
+  fw_loose[[cn]] <- ifelse(non_empty(fw_loose[[cn]]), 1L, 0L)
+}
+
+# Drop all-zero frameworks
+fw_strict <- fw_strict[, colSums(fw_strict, na.rm = TRUE) > 0, drop = FALSE]
+fw_loose  <- fw_loose[,  colSums(fw_loose,  na.rm = TRUE) > 0, drop = FALSE]
+
+# Counts
+n_total <- nrow(ind)
+strict_counts <- sort(colSums(fw_strict, na.rm = TRUE), decreasing = TRUE)
+loose_counts  <- sort(colSums(fw_loose,  na.rm = TRUE), decreasing = TRUE)
+
+# Top 4 for Venn
+top4_strict <- names(strict_counts)[seq_len(min(4, length(strict_counts)))]
+top4_loose  <- names(loose_counts)[seq_len(min(4, length(loose_counts)))]
+
+# Indicators with any framework
+n_with_any_strict <- sum(rowSums(fw_strict) > 0)
+n_with_any_loose  <- sum(rowSums(fw_loose)  > 0)
+
+# Topics & subtopics
+topic_col    <- if ("topic" %in% names(ind)) "topic" else NA
+subtopic_col <- if ("subtopic" %in% names(ind)) "subtopic" else NA
+
+topic_counts <- NULL
+if (!is.na(topic_col)){
+  tt <- ind[[topic_col]]
+  tt[is.na(tt) | tt == ""] <- "Unknown"
+  topic_counts <- sort(table(tt), decreasing = TRUE)
+}
+
+subtopic_counts <- list()
+if (!is.na(topic_col) && !is.na(subtopic_col)){
+  tt <- ind[[topic_col]]; st <- ind[[subtopic_col]]
+  tt[is.na(tt) | tt == ""] <- "Unknown"; st[is.na(st) | st == ""] <- "Unknown"
+  topics_unique <- unique(tt)
+  for (tp in topics_unique){
+    st_tp <- st[tt == tp]
+    subtopic_counts[[tp]] <- sort(table(st_tp), decreasing = TRUE)
+  }
+}
+
+# Build topic palette using user settings (or auto if requested)
+topic_levels  <- if (!is.null(topic_counts)) names(topic_counts) else character(0)
+topic_palette <- if (length(topic_levels) > 0) build_topic_palette(topic_levels, topic_palette_user, topic_palette_mode) else character(0)
+
+# Heatmap matrices
+HM_strict <- sort_overlap_matrix(pairwise_overlap_matrix(fw_strict), method = "total")
+HM_loose  <- sort_overlap_matrix(pairwise_overlap_matrix(fw_loose),  method = "total")
+
+# Inline summary helpers
+get_top_pair <- function(HM){
+  if (is.null(HM) || ncol(HM) < 2) return(list(label = "n/a", n = 0L))
+  k <- ncol(HM); best_n <- -1; best <- c(NA_character_, NA_character_)
+  for (i in 1:(k-1)) for (j in (i+1):k) {
+    n <- HM[i, j]
+    if (!is.na(n) && n > best_n) { best_n <- n; best <- c(colnames(HM)[i], colnames(HM)[j]) }
+  }
+  list(label = paste(best[1], "∩", best[2]), n = ifelse(best_n < 0, 0L, best_n))
+}
+tp_strict <- get_top_pair(HM_strict); strict_top_pair_label <- tp_strict$label; strict_top_pair_n <- tp_strict$n
+tp_loose  <- get_top_pair(HM_loose);  loose_top_pair_label  <- tp_loose$label;  loose_top_pair_n  <- tp_loose$n
+
+if (!is.null(HM_loose) && ncol(HM_loose) > 0){
+  tot_loose <- rowSums(HM_loose, na.rm = TRUE)
+  hubs_ord  <- names(sort(tot_loose, decreasing = TRUE))
+  hub1 <- if (length(hubs_ord) >= 1) hubs_ord[1] else NA_character_
+  hub1_tot <- if (!is.na(hub1)) tot_loose[hub1] else NA_integer_
+  hub2 <- if (length(hubs_ord) >= 2) hubs_ord[2] else NA_character_
+  hub2_tot <- if (!is.na(hub2)) tot_loose[hub2] else NA_integer_
+} else {
+  hub1 <- NA_character_; hub1_tot <- NA_integer_; hub2 <- NA_character_; hub2_tot <- NA_integer_
+}
+```
+
+# Introduction
+
+To prioritise climate change–related indicators, we catalogued **`r n_total`** indicators across key Pacific-relevant frameworks (e.g., SDGs, Global Set, SAMOA Pathway, Sendai Framework). For each indicator, we recorded:
+
+- the frameworks it belongs to (see Section 1);
+- its topic and subtopic (see Section 2);
+- the data sources, responsible agencies, and SPC divisions that can populate it (see Section 3);
+- data availability and completeness (see Section 4).
+
+The aim is to provide a concise overview of indicators relevant to the region, supporting prioritisation and the efficient allocation of effort and resources. Although the intention is to be as comprehensive as possible by drawing on all available metadata sources, some gaps may remain.
+
+# I. Frameworks
+Several frameworks have been included in the analysis, selected for their particular relevance to the Pacific region. This provides a coherent starting point for identifying and aligning potential indicators with regional priorities. While this first list is not intended to be exhaustive, it establishes a practical foundation on which additional frameworks can be integrated over time, ensuring that the indicator set remains both comprehensive and strategically relevant.
+
+- the [Global Set of Climate Change Statistics and Indicators](https://unstats.un.org/unsd/envstats/climatechange.cshtml), proposed by the UNSD;
+- the [Sustainable Development Goal Indicators](https://sdgs.un.org/), established in 2015 by the UN;
+- the [Sendai Framework for Disaster Risk Reduction 2015–2030](https://www.undrr.org/implementing-sendai-framework/what-sendai-framework), endorsed by the UNDRR;
+- the environmental indicators for Pacific Island Countries supported by [SPREP](https://www.sprep.org/);
+- the [Basic Set of Environment Statistics](https://unstats.un.org/unsd/envstats/fdes/basicset.cshtml), embedded in the FDES 2013;
+- the [SAMOA Pathway](https://www.un.org/ohrlls/content/samoa-pathway) for Small Island Developing States;
+- and other frameworks or sets of indicators such as the ones populated on the [IMF Climate Change Dashboard](https://climatedata.imf.org/).
+
+## Strict overlap
+
+Some indicators are deliberately defined in the same way across multiple frameworks. Identifying these exact overlaps is particularly important, as computing such indicators once enables countries to simultaneously demonstrate progress against targets from different frameworks. This creates clear opportunities to streamline data production, reduce reporting burdens, and ensure greater coherence in tracking progress across international agendas.
+
+```{r venn_strict_top4}
+if (length(top4_strict) >= 2){
+  sets <- list()
+  for (cn in top4_strict){
+    sets[[fw_label(cn)]] <- which(fw_strict[[cn]] == 1L)
+  }
+  grid.newpage()
+  venn.plot <- venn.diagram(
+    x = sets,
+    filename = NULL,
+    fill = pal_framework4,
+    alpha = 0.6,
+    cex = 1,
+    cat.cex = 1,
+    main = "Strict overlap between frameworks"
+  )
+  grid.draw(venn.plot)
+}
+```
+
+**Note.** Each circle represents one framework. Numbers inside the regions give the **count of indicators** in that exact set:
+
+- A number in a **non-overlapping** part of a circle = indicators linked **only** to that framework (i.e., defined the exact same way in both frameworks).
+- A number in a **two-way overlap** (intersection of two circles) = indicators linked to **both** frameworks, and similarly for 3-way/4-way overlaps.
+- An indicator that belongs to multiple frameworks is counted **once**, in the most specific overlapping region it fits.
+
+Only the **top four frameworks** (by number of linked indicators) are shown here; overlaps involving other frameworks are not displayed in this Venn diagram. The diagram's **areas are not proportional** to counts-use the printed numbers to interpret magnitudes. The companion figure labelled "any linkage" is interpreted the same way but includes broader relationships.
+
+```{r heatmap_strict, fig.width=11, fig.height=8}
+if (!is.null(HM_strict) && ncol(HM_strict) >= 2){
+  M <- HM_strict
+  rownames(M) <- fw_label(rownames(M)); colnames(M) <- fw_label(colnames(M))
+  plot_overlap_heatmap(M, title = "Strict overlap between frameworks")
+}
+```
+
+**Note.** Rows and columns indicate frameworks. Each cell shows the **number of indicators shared** by the two frameworks at that row/column intersection, using **formal codes** (strict overlap). Darker cells indicate **larger overlaps**; lighter cells mean fewer or none. The matrix is **symmetric** (A–B equals B–A). Frameworks are **reordered** so that highly connected ones lie closer together (hot blocks along the diagonal help reveal clusters/hubs). Reading tip: scan a framework’s **row** to see which other frameworks it most frequently co-occurs with. The companion heatmap for "any linkage" is interpreted the same way but includes broader relationships.
+
+```{r overlap_paragraph_strict, results='asis'}
+make_overlap_paragraph <- function(bin, HM, title = "Summary") {
+  if (is.null(HM) || ncol(HM) < 2) {
+    cat("**", title, ".** Not enough frameworks to summarise.\n\n", sep = ""); return(invisible())
+  }
+  sizes <- colSums(bin, na.rm = TRUE); names(sizes) <- fw_label(names(sizes))
+  colnames(HM) <- fw_label(colnames(HM)); rownames(HM) <- fw_label(rownames(HM))
+  
+  k <- ncol(HM); recs <- list()
+  for (i in 1:(k-1)) for (j in (i+1):k) {
+    n <- HM[i, j]
+    if (!is.na(n)) {
+      a <- colnames(HM)[i]; b <- colnames(HM)[j]
+      minsz <- suppressWarnings(min(sizes[a], sizes[b], na.rm = TRUE))
+      cover <- if (is.finite(minsz) && minsz > 0) n / minsz else NA_real_
+      denom <- sizes[a] + sizes[b] - n
+      jacc  <- if (is.finite(denom) && denom > 0) n / denom else NA_real_
+      recs[[length(recs) + 1]] <- data.frame(a=a, b=b, n=as.numeric(n),
+                                             cover=as.numeric(cover), jacc=as.numeric(jacc),
+                                             stringsAsFactors = FALSE)
+    }
+  }
+  if (!length(recs)) { cat("**", title, ".** No pairwise overlaps found.\n\n", sep = ""); return(invisible()) }
+  df <- do.call(rbind, recs)
+  
+  ord_n <- order(-df$n, -df$cover, -df$jacc); top_n <- utils::head(df[ord_n, ], 3)
+  df_j  <- df[is.finite(df$jacc) & df$n > 0, , drop = FALSE]
+  ord_j <- order(-df_j$jacc, -df_j$n); top_j <- utils::head(df_j[ord_j, ], 2)
+  
+  pieces <- c(sprintf("**%s.** We analysed %d frameworks.", title, ncol(HM)))
+  if (nrow(top_n) >= 1) pieces <- c(pieces, paste0("Largest pairwise overlaps: ",
+                                                   paste(sprintf("%s and %s (%d shared)", top_n$a, top_n$b, top_n$n), collapse = "; "), "."))
+  if (nrow(top_j) >= 1) pieces <- c(pieces, paste0("Normalising for the portofolio size (i.e., number of indicators defined in a given framework), the tightest links are ",
+                                                   paste(sprintf("%s–%s (Jaccard %.2f; %d shared)", top_j$a, top_j$b, top_j$jacc, top_j$n), collapse = "; "), "."))
+  cat(paste(pieces, collapse = " "), "\n\n", sep = "")
+}
+make_overlap_paragraph(fw_strict, HM_strict, "Takeaway")
+```
+
+## Related frameworks
+
+While indicators vary across frameworks, many are conceptually close or measure related aspects. To account for this, we assess overlaps using a more loosely defined approach, capturing not only exact matches but also thematic and methodological similarities. This perspective underscores potential synergies: an indicator reported under one framework may already inform, or even directly support, the computation of a related indicator in another. Such cross-framework linkages are critical for reducing duplication, leveraging existing data flows, and improving efficiency in monitoring and reporting across multiple international commitments. At the same time, a looser definition of overlap also carries risks, as it can blur distinctions between indicators and introduce uncertainty in comparability. This reinforces the need to balance efficiency gains with methodological rigour when identifying synergies across frameworks.
+
+```{r venn_loose_top4}
+if (length(top4_loose) >= 2){
+  sets <- list()
+  for (cn in top4_loose){
+    sets[[fw_label(cn)]] <- which(fw_loose[[cn]] == 1L)
+  }
+  grid.newpage()
+  venn.plot <- venn.diagram(
+    x = sets,
+    filename = NULL,
+    fill = pal_framework4,
+    alpha = 0.6,
+    cex = 1,
+    cat.cex = 1,
+    main = "Loose overlap between frameworks"
+  )
+  grid.draw(venn.plot)
+}
+```
+
+```{r heatmap_loose, fig.width=11, fig.height=8}
+if (!is.null(HM_loose) && ncol(HM_loose) >= 2){
+  M <- HM_loose
+  rownames(M) <- fw_label(rownames(M)); colnames(M) <- fw_label(colnames(M))
+  plot_overlap_heatmap(M, title = "Loose overlap between frameworks")
+}
+```
+
+## Take away
+
+Out of the **`r n_total`** indicators, **`r ifelse(n_with_any_loose == n_total, "all indicators", paste(n_with_any_loose, "indicators"))`** have at least one noted linkage across frameworks. Using **formal codes**, the largest pairwise overlap is **`r strict_top_pair_label`** with **`r strict_top_pair_n`** common indicators. Using **any linkage**, the largest overlap is **`r loose_top_pair_label`** with **`r loose_top_pair_n`** common indicators.
+
+# II. Topics and subtopics
+The topics and subtopics were defined in the Global Set of Climate Change Statistics and Indicators, endorsed by the UNSD. 
+
+*Following the 2022 adoption of the Global Set, UNSD has continued to collaborate with the United Nations Framework Convention on Climate Change (UNFCCC) to ensure the consistent and strengthened implementation of the Global Set in countries. This will assist member states' national statistical offices (NSOs) in collaboration with national climate policy authorities to be able, inter alia, to:*
+
+- *develop national climate change statistical programmes;*
+- *strengthen the capacity to monitor climate change impacts, adaptation and mitigation actions;*
+- *increase involvement in climate change related data collection and submission of indicators to UNFCCC for supporting the implementation of the Paris Agreement; and*
+- *produce and disseminate climate change statistics via dedicated reports, websites and other means.*
+
+*[Source, accessed on  August 12th, 2025](https://unstats.un.org/unsd/envstats/climatechange.cshtml)*
+
+A schematic framework developed by the IPCC summarises the complexity of climate change as a sequence of events: drivers, impacts, vulnerability, mitigation and adaptation. These events are applied as five top-level topics in the Global Set. Each indicator is assigned to one of the five IPCC areas as a primary belonging. As in the FDES, the subtopics represent the quantifiable aspects of the areas taking into account the types and sources of the statistics needed to describe them.
+
+*[Source, accessed on  August 12th, 2025](https://unstats.un.org/unsd/statcom/53rd-session/documents/BG-3m-Globalsetandmetadata-E.pdf)*
+
+**Warning.** With the exception of indicators defined directly within the Global Set, Topics and Subtopics were assigned *a posteriori* to each indicator. This introduces certain limitations: some indicators have been attributed to a single Topic/Subtopic even though they are conceptually linked to several. As a result, the coverage of some Subtopics may be underestimated, and the broader cross-cutting relevance of certain indicators may not be fully reflected in the portfolio.
+
+## Topics
+
+The most populated **topics** are `r if(!is.null(topic_counts)) paste(names(head(topic_counts, 5)), " (", head(as.integer(topic_counts), 5), " indicators)", sep="", collapse = "; ") else "No topic column found."`
+
+```{r topics_barplot}
+if (!is.null(topic_counts) && length(topic_counts) > 0){
+  op <- par(mar = c(5, 14, 3, 2), bty = "n")
+  topics_ordered <- rev(names(topic_counts))
+  cols <- if (length(topic_palette)>0) topic_palette[topics_ordered] else rep("grey70", length(topic_counts))
+  barplot(
+    rev(as.integer(topic_counts)),
+    names.arg = topics_ordered,
+    horiz = TRUE,
+    las = 1,
+    main = "Indicators per topic",
+    xlab = "Number of indicators",
+    cex.main = cex_main, cex.lab = cex_lab, cex.axis = cex_axis, cex.names = cex_names,
+    col = cols, border = NA
+  )
+  par(op)
+}
+```
+
+## Subtopics within each topic
+
+```{r subtopics_per_topic, results='asis'}
+# --- Subtopics per topic (with ranked colour intensity: top = darkest) ---
+if (length(subtopic_counts) > 0){
+  ordered_topics <- names(topic_counts)
+
+  # Lighten helper if you don't already have one
+  if (!exists("ds_lighten")) {
+    ds_lighten <- function(hex, f = 0.85){
+      rgbv <- col2rgb(hex)
+      target <- 255
+      r <- rgbv[1,1] + (target - rgbv[1,1]) * f
+      g <- rgbv[2,1] + (target - rgbv[2,1]) * f
+      b <- rgbv[3,1] + (target - rgbv[3,1]) * f
+      grDevices::rgb(r, g, b, maxColorValue = 255)
+    }
+  }
+
+  for (tp in ordered_topics){
+    if (!tp %in% names(subtopic_counts)) next
+    tb <- subtopic_counts[[tp]]  # already sorted decreasing earlier
+    cat("### ", tp, "\n\n", sep = "")
+    if (length(tb) > 0){
+      n_tb <- length(tb)
+
+      # Build a light->dark ramp from the topic's base colour, then reverse for barplot
+      base_col <- if (tp %in% names(topic_palette)) topic_palette[[tp]] else "grey60"
+      cols_ld  <- grDevices::colorRampPalette(c(ds_lighten(base_col, 0.85), base_col))(n_tb)
+      # Because we call rev() on values/names to put the largest at the TOP,
+      # we also reverse the colours so the TOP bar gets the DARKEST colour.
+      cols_for_bars <- rev(cols_ld)
+
+      op <- par(mar = c(5, 20, 3, 2), bty = "n")
+      barplot(
+        rev(as.integer(tb)),
+        names.arg = rev(names(tb)),
+        horiz = TRUE,
+        las = 1,
+        main = paste("Subtopics in", tp),
+        xlab = "Number of indicators",
+        cex.main = cex_main, cex.lab = cex_lab, cex.axis = cex_axis, cex.names = 0.70,
+        col = rev(cols_for_bars), border = NA
+      )
+      par(op)
+
+      cat("**Takeaway.** Top subtopic: **", names(tb)[1], "** (", as.integer(tb[1]), ").", sep = "")
+      if (length(tb) > 1){
+        others <- paste(paste0(names(tb)[2:min(5,length(tb))], " (", as.integer(tb[2:min(5,length(tb))]), ")"),
+                        collapse = "; ")
+        cat(" Other prominent subtopics: ", others, ".", sep = "")
+      }
+      cat("\n\n")
+    } else {
+      cat("_No subtopics found._\n\n")
+    }
+  }
+}
+
+```
+
+# III. Data sources and responsible agencies
+
+Each indicator is usually associated with one or more responsible agencies, which often act as data custodians. These agencies are typically the first point of reference, as they are most likely to already hold the relevant data or have established reporting mechanisms.
+
+In addition, indicators draw on different types of data sources, such as administrative records, household or business surveys, population censuses, geospatial data (e.g., maps, remote sensing), and environmental monitoring systems. Each source type has specific strengths and limitations: administrative data are usually continuous but may have limited coverage; surveys and censuses provide rich detail but are periodic; geospatial sources offer spatially explicit insights; and monitoring data often provide high-frequency time series.
+
+Within this context, SPC's Statistics for Development Division (SDD) holds extensive microdata collections from censuses and household surveys across the Pacific. This makes indicators derived from surveys and censuses comparatively easier to populate, as the underlying data are already available and can be directly re-analysed or repurposed to align with different frameworks.
+
+```{r ds_detect_and_expand}
+nm <- names(ind)
+col_source <- ds_pick_col(nm, c("^data[_ ]?source$", "source", "dataset|platform"))
+col_dtype  <- ds_pick_col(nm, c("^data[ _-]?type[s]?$", "source[ _-]?type[s]?$", "datatype"))
+col_agency <- ds_pick_col(nm, c("responsible|custodian|owner|agency"))
+col_spc    <- ds_pick_col(nm, c("^spc[_ ]?division$", "^spc$", "division"))
+col_title  <- ds_pick_col(nm, c("^indicator(_name|_title)?$", "^name$", "^title$"))
+col_id     <- ds_pick_col(nm, c("^indicator[_ ]?id$","^id$","^code$"))
+col_topic  <- ds_pick_col(nm, c("^topic$"))
+
+if (is.na(col_title)) col_title <- nm[1]
+
+has_source <- !is.na(col_source) && col_source %in% nm
+has_dtype  <- !is.na(col_dtype)  && col_dtype  %in% nm
+has_agency <- !is.na(col_agency) && col_agency %in% nm
+has_spc    <- !is.na(col_spc)    && col_spc    %in% nm
+has_topic  <- !is.na(col_topic)  && col_topic  %in% nm
+has_id     <- !is.na(col_id)     && col_id     %in% nm
+
+row_id <- seq_len(nrow(ind))
+
+ag_long <- if (has_agency) {
+  ag_list <- lapply(ind[[col_agency]], ds_split_multi)
+  ag_vals <- unlist(ag_list, use.names = FALSE)
+  ag_id   <- rep(row_id, times = sapply(ag_list, length))
+  if (length(ag_vals)){
+    data.frame(row_id = ag_id, agency = ds_norm(ag_vals), stringsAsFactors = FALSE)
+  } else data.frame(row_id = integer(0), agency = character(0))
+} else data.frame(row_id = integer(0), agency = character(0))
+
+spc_long <- if (has_spc) {
+  spc_list <- lapply(ind[[col_spc]], ds_split_multi)
+  spc_vals <- unlist(spc_list, use.names = FALSE)
+  spc_id   <- rep(row_id, times = sapply(spc_list, length))
+  if (length(spc_vals)){
+    data.frame(row_id = spc_id, spc_div = ds_norm(spc_vals), stringsAsFactors = FALSE)
+  } else data.frame(row_id = integer(0), spc_div = character(0))
+} else data.frame(row_id = integer(0), spc_div = character(0))
+
+topic_vec <- if (has_topic) { v <- as.character(ind[[col_topic]]); v[is.na(v) | v=="" ] <- "Unknown"; v } else rep("Unknown", nrow(ind))
+
+dtype_long <- if (has_dtype){
+  dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals <- unlist(dt_list, use.names = FALSE)
+  dt_id   <- rep(row_id, times = sapply(dt_list, length))
+  if (length(dt_vals)){
+    canon <- function(s){
+      s <- tolower(s)
+      if (grepl("\\bsurv", s)) return("Survey")
+      if (grepl("admin|registry|permit|licen", s)) return("Administrative")
+      if (grepl("\\bdb\\b|database|databank|portal", s)) return("Database")
+      if (grepl("map|gis|spatial|geospatial|remote|satell", s)) return("Maps/Geospatial")
+      if (grepl("model|estim|project|simulat|reanalys", s)) return("Model")
+      return(ds_titlecase(s))
+    }
+    dt_vals <- vapply(dt_vals, canon, "")
+    unique(data.frame(row_id = dt_id, type = dt_vals, stringsAsFactors = FALSE))
+  } else data.frame(row_id = integer(0), type = character(0))
+} else data.frame(row_id = integer(0), type = character(0))
+
+n_total <- nrow(ind)
+n_with_source <- if (has_source) sum(nchar(ds_norm(ifelse(is.na(ind[[col_source]]), "", ind[[col_source]]))) > 0) else 0L
+n_with_agency <- if (has_agency) sum(nchar(ds_norm(ifelse(is.na(ind[[col_agency]]), "", ind[[col_agency]]))) > 0) else 0L
+n_with_spc    <- if (has_spc)    sum(nchar(ds_norm(ifelse(is.na(ind[[col_spc]]),    "", ind[[col_spc]])))    > 0) else 0L
+
+top_agencies <- if (nrow(ag_long)) sort(table(ag_long$agency), decreasing = TRUE) else integer(0)
+agency_levels <- if (length(top_agencies)) names(top_agencies) else character(0)
+agency_pretty_map <- setNames(vapply(agency_levels, function(a) ds_titlecase(a), ""), agency_levels)
+
+topic_agency_mat <- NULL
+if (nrow(ag_long)){
+  ta <- data.frame(topic = topic_vec[ag_long$row_id], agency = ag_long$agency, stringsAsFactors = FALSE)
+  tab <- table(ta$topic, ta$agency)
+  if (ncol(tab) > 30){
+    ord <- order(colSums(tab), decreasing = TRUE)
+    tab <- tab[, ord[1:30], drop = FALSE]
+  }
+  colnames(tab) <- if (ncol(tab)) ds_trunc(agency_pretty_map[colnames(tab)], 36) else colnames(tab)
+  topic_agency_mat <- tab
+}
+
+topic_type_mat <- NULL
+if (nrow(dtype_long)){
+  tt <- data.frame(topic = topic_vec[dtype_long$row_id], type = dtype_long$type, stringsAsFactors = FALSE)
+  topic_type_mat <- table(tt$topic, tt$type)
+}
+```
+
+## Coverage
+
+Out of `r fmt_int(n_total)` indicators, **`r fmt_int(n_with_source)`** (`r fmt_pct(n_with_source, n_total)`) list at least one data source; **`r fmt_int(n_with_agency)`** (`r fmt_pct(n_with_agency, n_total)`) have a designated responsible agency; and **`r fmt_int(n_with_spc)`** (`r fmt_pct(n_with_spc, n_total)`) are mapped to at least one SPC division.
+
+## Top agencies
+
+```{r agencies_top_bar, fig.width=11, fig.height=6}
+if (length(top_agencies)){
+  op <- par(mar = c(5, 20, 3, 2), bty = "n")
+  vals <- as.integer(top_agencies[1:min(15, length(top_agencies))])
+  labs_raw <- names(top_agencies)[1:min(15, length(top_agencies))]
+  labs <- ds_trunc(agency_pretty_map[labs_raw], 35)
+
+  # Custom colour gradient
+  cols <- colorRampPalette(c("#5f0f40", "#f4f1de"))(length(vals))
+
+  barplot(rev(vals),
+          names.arg = rev(labs),
+          horiz = TRUE, las = 1,
+          xlab = "Number of indicators",
+          main = "Indicators per responsible agency (top 15)",
+          col = rev(cols),  # reverse so darkest = highest values
+          border = NA,
+          cex.axis = 0.85, cex.names = 0.82)
+  par(op)
+}
+```
+
+```{r agencies_takeaway, results='asis'}
+if (length(top_agencies)){
+  tot_assigned <- sum(top_agencies)
+  topk <- min(5, length(top_agencies))
+  share_topk <- round(100 * sum(top_agencies[1:topk]) / max(1, tot_assigned))
+  lead <- agency_pretty_map[names(top_agencies)[1]]
+  nxt  <- if (length(top_agencies) >= 2) agency_pretty_map[names(top_agencies)[2]] else NA
+  cat("**Takeaway.** ", lead, " leads by portfolio size with ", fmt_int(top_agencies[1]), " indicators",
+      if (!is.na(nxt)) paste0(", followed by ", nxt, " (", fmt_int(top_agencies[2]), ")") else "",
+      ". Together, the top ", topk, " agencies account for ", share_topk, "% of all assigned indicators.\n\n", sep = "")
+}
+```
+
+```{r topic_agency_heatmap, fig.width=12, fig.height=9}
+if (!is.null(topic_agency_mat)) {
+  M <- suppressWarnings(as.matrix(topic_agency_mat))
+  if (all(dim(M) > 0)) {
+    if (nrow(M) == 1 || ncol(M) == 1) {
+      pal <- hcl.colors(max(2, length(M)), "YlGnBu")
+      if (nrow(M) == 1) {
+        vals <- as.numeric(M[1, ]); labs <- colnames(M)
+        op <- par(mar = c(10, 4, 3, 2), bty = "n")
+        barplot(vals, names.arg = labs, las = 2,
+                main = "Topic × Agency - indicator counts",
+                ylab = "Indicators", col = pal, border = NA,
+                cex.names = 0.75, cex.axis = 0.85)
+        par(op)
+      } else {
+        vals <- as.numeric(M[, 1]); labs <- rownames(M)
+        op <- par(mar = c(5, min(max(8, 0.6 * length(labs)), 26), 3, 2), bty = "n")
+        barplot(rev(vals), names.arg = rev(labs), horiz = TRUE, las = 1,
+                main = "Topic × Agency - indicator counts",
+                xlab = "Indicators", col = rev(hcl.colors(max(2, length(vals)), "YlGnBu")),
+                border = NA, cex.names = 0.75, cex.axis = 0.85)
+        par(op)
+      }
+    } else {
+      col_start <- heat_col_start; col_end <- heat_col_end
+      pal <- grDevices::colorRampPalette(c(col_start, col_end))(100)
+      
+      r <- nrow(M); c <- ncol(M)
+      Z <- M[rev(seq_len(r)), , drop = FALSE]
+      storage.mode(Z) <- "numeric"
+      
+      xlabs <- colnames(Z); if (is.null(xlabs)) xlabs <- paste("Agency", seq_len(c))
+      ylabs <- rownames(Z); if (is.null(ylabs)) ylabs <- paste("Topic",  seq_len(r))
+      xlabs <- ifelse(is.na(xlabs) | xlabs=="", paste("Agency", seq_len(c)), xlabs)
+      ylabs <- ifelse(is.na(ylabs) | ylabs=="", paste("Topic",  seq_len(r)), ylabs)
+      xlabs <- ds_trunc(xlabs, 36)
+      ylabs <- ds_trunc(ylabs, 28)
+      
+      layout(matrix(c(1, 2), 1), widths = c(4.3, 0.6))
+      opar <- par(no.readonly = TRUE); on.exit({par(opar); layout(1)}, add = TRUE)
+      left_mar <- min(max(10, r * 0.7), 26)
+      par(mar = c(10, left_mar, 3, 1), bty = "n")
+      
+      x <- seq_len(c); y <- seq_len(r)
+      zplot <- t(Z)
+      image(x = x, y = y, z = zplot, col = pal, axes = FALSE, xlab = "", ylab = "", useRaster = TRUE)
+      
+      axis(1, at = x, labels = xlabs, las = 2, cex.axis = 0.72)
+      axis(2, at = y, labels = ylabs, las = 2, cex.axis = 0.72)
+      box(); title(main = "Topic × Agency - indicator counts", cex.main = 0.95)
+      
+      par(mar = c(10, 1, 3, 6))
+      zmin <- 0; zmax <- max(Z, na.rm = TRUE); if (!is.finite(zmax) || zmax == 0) zmax <- 1
+      zgrad <- matrix(seq(zmin, zmax, length.out = 100), nrow = 1, ncol = 100)
+      image(x = 1:1, y = seq(zmin, zmax, length.out = 100), z = zgrad,
+            col = pal, axes = FALSE, xlab = "", ylab = "", useRaster = TRUE)
+      ticks <- pretty(c(zmin, zmax))
+      axis(4, at = ticks, labels = as.character(round(ticks)), las = 1, cex.axis = 0.75)
+      mtext("Indicators", side = 4, line = 3, cex = 0.85)
+    }
+  } else {
+    cat("_Topic × Agency heatmap skipped: no agencies/topics to plot._\n")
+  }
+} else {
+  cat("_Topic × Agency heatmap skipped: no matrix available._\n")
+}
+```
+
+```{r topic_agency_takeaway, results='asis'}
+if (!is.null(topic_agency_mat) && all(dim(topic_agency_mat) > 0)){
+  M <- as.matrix(topic_agency_mat)
+  which_max <- which(M == max(M), arr.ind = TRUE)[1, , drop = FALSE]
+  t_star <- rownames(M)[which_max[1]]
+  a_star <- colnames(M)[which_max[2]]
+  n_star <- M[which_max]
+  top_topic <- names(sort(rowSums(M), decreasing = TRUE))[1]
+  top_ag    <- names(sort(colSums(M), decreasing = TRUE))[1]
+  cat("**Takeaway.** The densest cell is **", t_star, " × ", a_star, "** with **", fmt_int(n_star), "** indicators. ",
+      "Overall, **", top_topic, "** has the most agency activity, and **", top_ag, "** spans the broadest set of topics.\n\n", sep = "")
+}
+```
+
+## Needed data to compute indicators
+
+```{r dtype_mix_panel, fig.width=12, fig.height=7, results='asis'}
+if (exists("has_dtype") && isTRUE(has_dtype)) {
+  # Split & normalise the Data Type column
+  dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals <- unlist(dt_list, use.names = FALSE)
+  dt_id   <- rep(seq_len(nrow(ind)), times = sapply(dt_list, length))
+
+  if (length(dt_vals)) {
+    dtype_long_raw <- unique(data.frame(
+      row_id = dt_id,
+      type   = ds_norm(dt_vals),
+      stringsAsFactors = FALSE
+    ))
+
+    # Topic vector (clean)
+    topic_vec2 <- if (exists("topic_vec")) topic_vec else {
+      v <- ind[[col_topic]]; v[is.na(v) | v==""] <- "Unknown"; as.character(v)
+    }
+
+    # Cross-tab
+    tt  <- data.frame(topic = topic_vec2[dtype_long_raw$row_id],
+                      type  = dtype_long_raw$type, stringsAsFactors = FALSE)
+    tab <- table(tt$topic, tt$type)
+
+    # Indicator counts per topic
+    topic_ind_count <- table(topic_vec2)
+
+    # Select top 5 topics by count
+    topics_all  <- intersect(names(sort(topic_ind_count, decreasing = TRUE)), rownames(tab))
+    topics_keep <- topics_all[seq_len(min(5, length(topics_all)))]
+
+    if (length(topics_keep)) {
+      # ---- Consistent colour mapping ----
+      types_all <- colnames(tab)
+      pal_all <- if (exists("pal_dtype_all")) {
+        rep(pal_dtype_all, length.out = length(types_all))
+      } else if (exists("pal_dtype4")) {
+        rep(pal_dtype4, length.out = length(types_all))
+      } else {
+        grDevices::rainbow(max(length(types_all), 3))
+      }
+      col_map <- setNames(pal_all[seq_along(types_all)], types_all)
+
+      # ---- PLOTS ----
+      op <- par(mfrow = c(1, length(topics_keep)), bty = "n"); on.exit(par(op), add = TRUE)
+
+      for (i in seq_along(topics_keep)) {
+        tp <- topics_keep[i]
+        n_denom <- as.integer(topic_ind_count[tp])
+        if (i == 1) par(mar = c(6, 7, 5, 1)) else par(mar = c(6, 1.5, 5, 1))
+
+        if (is.na(n_denom) || n_denom == 0) {
+          plot.new(); title(main = paste0(tp, " (n=0)"), cex.main = 1.15); next
+        }
+
+        counts <- as.numeric(tab[tp, ]); names(counts) <- colnames(tab)
+        props  <- counts / n_denom
+        nz <- which(props > 0)
+        if (!length(nz)) { plot.new(); title(main = paste0(tp, " (n=", n_denom, ")"), cex.main = 1.15); next }
+
+        ord <- order(props[nz], decreasing = TRUE)
+        keep_idx <- nz[ord][seq_len(min(4, length(ord)))]
+        vals <- props[keep_idx]
+        labs <- names(props)[keep_idx]
+        cols <- as.character(col_map[labs])
+
+        mids <- barplot(100 * vals,
+                        ylim = c(0, 110),
+                        col = cols, border = NA,
+                        main = paste0(tp, " (n=", n_denom, ")"), cex.main = 1.15,
+                        ylab = if (i == 1) "Share of indicators (%)" else "",
+                        axes = FALSE,
+                        names.arg = rep("", length(labs)))  # remove x labels
+
+        if (i == 1) {
+          axis(2, at = seq(0, 100, 20), las = 1, cex.axis = 1.05)
+          # Add legend only in the first plot
+          legend("topleft",
+                 legend = if (exists("ds_titlecase")) vapply(types_all, ds_titlecase, "") else types_all,
+                 fill   = col_map[types_all],
+                 border = NA, bty = "n", cex = 1.3)
+        }
+
+        # Add counts above bars
+        text(x = mids, y = 100 * vals, labels = counts[labs], pos = 3, xpd = NA, cex = 0.9)
+      }
+
+    } else {
+      knitr::asis_output("_No topics with documented Data Type values to plot._\n\n")
+    }
+  } else {
+    knitr::asis_output("_No values found in the Data Type column._\n\n")
+  }
+} else {
+  knitr::asis_output("_No Data Type column detected in the file._\n\n")
+}
+```
+
+**Note.** Panel titles include the total number of indicators (e.g. *Impacts (n=83)*). Bar **height** represents the percentage of indicators using that data type within the topic, while the **number above** each bar shows the absolute count. Sums across data types may exceed 100% because a single indicator can be associated with multiple sources.
+
+```{r dtype_mix_takeaway, results='asis'}
+if (exists("has_dtype") && isTRUE(has_dtype)) {
+  # Split & normalise
+  dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals <- unlist(dt_list, use.names = FALSE)
+  dt_id   <- rep(seq_len(nrow(ind)), times = sapply(dt_list, length))
+
+  if (length(dt_vals)) {
+    dtype_long_raw <- unique(data.frame(
+      row_id = dt_id,
+      type   = ds_norm(dt_vals),
+      stringsAsFactors = FALSE
+    ))
+
+    # Tabulate overall frequency of each source
+    source_counts <- sort(table(dtype_long_raw$type), decreasing = TRUE)
+    n_total <- sum(source_counts)
+
+    if (length(source_counts) >= 2) {
+      top_two <- head(source_counts, 2)
+      top_labels <- names(top_two)
+      top_pct <- round(100 * top_two / n_total, 1)
+
+      line <- paste0("**Takeaway.** Across all indicators, the two most common data sources are ",
+                     "**", if (exists("ds_titlecase")) ds_titlecase(top_labels[1]) else top_labels[1],
+                     "** (", top_two[1], " indicators; ", top_pct[1], "%) and ",
+                     "**", if (exists("ds_titlecase")) ds_titlecase(top_labels[2]) else top_labels[2],
+                     "** (", top_two[2], " indicators; ", top_pct[2], "%).")
+
+      knitr::asis_output(line)
+    } else if (length(source_counts) == 1) {
+      top_labels <- names(source_counts)
+      top_pct <- round(100 * source_counts / n_total, 1)
+      line <- paste0("**Takeaway.** Across all indicators, the most common data source is ",
+                     "**", if (exists("ds_titlecase")) ds_titlecase(top_labels) else top_labels,
+                     "** (", source_counts, " indicators; ", top_pct, "%).")
+      knitr::asis_output(line)
+    } else {
+      knitr::asis_output("_No documented Data Source values available for takeaway._")
+    }
+  }
+}
+```
+
+## Take away
+
+```{r ds_summary_text, results='asis'}
+pieces <- c()
+pieces <- c(pieces, paste0("**Ownership & coverage.** ",
+                           fmt_int(n_with_agency), " indicators have a responsible agency (", fmt_pct(n_with_agency, n_total), "); ",
+                           fmt_int(n_with_source), " list at least one data source (", fmt_pct(n_with_source, n_total), "); ",
+                           fmt_int(n_with_spc), " are mapped to an SPC division (", fmt_pct(n_with_spc, n_total), ")."))
+
+if (length(top_agencies)){
+  lead <- agency_pretty_map[names(top_agencies)[1]]
+  pieces <- c(pieces, paste0("**Who leads.** The largest portfolio is held by **", lead, "** (", fmt_int(top_agencies[1]), ")",
+                             if (length(top_agencies) >= 2) paste0(", followed by **", agency_pretty_map[names(top_agencies)[2]], "** (", fmt_int(top_agencies[2]), ")") else "",
+                             "."))
+}
+
+if (!is.null(topic_type_mat) && all(dim(topic_type_mat) > 0)){
+  dt_list_all <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals_all <- unlist(dt_list_all, use.names = FALSE)
+  if (length(dt_vals_all)){
+    dtype_long_all <- unique(data.frame(row_id = rep(seq_len(nrow(ind)), times = sapply(dt_list_all, length)),
+                                        type   = ds_norm(dt_vals_all), stringsAsFactors = FALSE))
+    overall <- sort(table(dtype_long_all$type), decreasing = TRUE)
+    generic <- c("other","others","misc","miscellaneous","unknown","not specified","unspecified","n/a","na")
+    filtered <- overall[!(tolower(names(overall)) %in% generic)]
+    use_counts <- if (length(filtered)) filtered else overall
+    k <- min(3, length(use_counts))
+    labs <- vapply(names(use_counts)[1:k], ds_titlecase, "")
+    nums <- as.integer(use_counts[1:k])
+    if (k >= 1) {
+      msg <- paste0("**Data-type landscape.** Most frequently cited: **", labs[1], "** (", fmt_int(nums[1]), ")")
+      if (k >= 2) msg <- paste0(msg, ", followed by **", labs[2], "** (", fmt_int(nums[2]), ")")
+      if (k >= 3) msg <- paste0(msg, ", and **", labs[3], "** (", fmt_int(nums[3]), ")")
+      msg <- paste0(msg, ".")
+      pieces <- c(pieces, msg)
+    }
+  }
+}
+knitr::asis_output(paste(pieces, collapse = " "))
+```
+
+# IV. Availability & completeness
+
+## What we use here
+
+**Spatial completeness.** Number of SPC Pacific Island members with data for an indicator out of our **22** members (expressed as 0–100%).  
+**Temporal completeness.** Within an indicator’s *sampled year range* (earliest to latest year recorded), the share of years that have data (years present / years possible in-range).  
+**Completeness.** The completeness is computed as the 
+$$
+Completeness = Completeness_{space}\;(\frac{Time_{sampled}}{Time_{desired}}\;\times\;Completeness_{time}) $$
+
+```{r completeness_from_file_detect}
+nm <- names(ind)
+col_spatial  <- ds_pick_col(nm, c("^spatial[ _-]?completeness$", "spatial.*complet|geo.*cover|country.*cover|spc.*cover"))
+col_temporal <- ds_pick_col(nm, c("^temporal[ _-]?completeness$", "temporal.*complet|time.*complet|year.*complet"))
+
+col_topic2 <- if ("topic" %in% nm) "topic" else ds_pick_col(nm, c("^topic$"))
+col_title2 <- ds_pick_col(nm, c("^indicator(_name|_title)?$", "^name$", "^title$"))
+col_id2    <- ds_pick_col(nm, c("^indicator[_ ]?id$","^id$","^code$"))
+
+n_total2 <- nrow(ind)
+topic_vec2 <- if (!is.na(col_topic2)) { v <- as.character(ind[[col_topic2]]); v[is.na(v) | v=="" ] <- "Unknown"; v } else rep("Unknown", n_total2)
+title_vec2 <- if (!is.na(col_title2)) as.character(ind[[col_title2]]) else paste("Indicator", seq_len(n_total2))
+if (!is.na(col_id2)) title_vec2 <- ifelse(is.na(ind[[col_id2]]) | ind[[col_id2]]=="", title_vec2, paste(ind[[col_id2]], title_vec2, sep = " - "))
+
+spatial  <- if (!is.na(col_spatial))  ind[[col_spatial]]  else rep(NA_real_, n_total2)
+temporal <- if (!is.na(col_temporal)) ind[[col_temporal]] else rep(NA_real_, n_total2)
+
+comp_df <- data.frame(
+  indicator = title_vec2,
+  topic     = topic_vec2,
+  spatial   = spatial,
+  temporal  = temporal,
+  stringsAsFactors = FALSE
+)
+both_ok <- complete.cases(comp_df$spatial, comp_df$temporal)
+
+# Build topic palette with same user/auto logic for completeness plots
+if (!exists("topic_palette") || !length(topic_palette)) {
+  topic_palette <- build_topic_palette(unique(comp_df$topic), topic_palette_user, topic_palette_mode)
+}
+```
+
+```{r completeness_histograms, fig.width=10, fig.height=7}
+# Spatial & temporal are already 0–1
+spatial_vals  <- comp_df$spatial
+temporal_vals <- comp_df$temporal
+
+# Overall comes from the original column (not scaled!)
+overall_vals  <- suppressWarnings(as.numeric(ind$completeness))
+
+# Titles with n
+title_sp <- paste0("Spatial completeness (n=", sum(is.finite(spatial_vals)), ")")
+title_tp <- paste0("Temporal completeness (n=", sum(is.finite(temporal_vals)), ")")
+title_ov <- paste0("Overall completeness (n=", sum(is.finite(overall_vals)), ")")
+
+# Plot
+op <- par(mfrow=c(1,3), mar=c(4,4,3,1))
+hist(spatial_vals,  breaks=10, col="#619b8a", main=title_sp, border = "white",
+     xlab="Spatial completeness", ylab = "Indicator count")
+hist(temporal_vals, breaks=10, col="#a1c181", main=title_tp, border = "white",
+     xlab="Temporal completeness", xlim=c(0, max(temporal_vals, na.rm=TRUE)),
+     ylab = NA)
+hist(overall_vals,  breaks=10, col="#ffbe0b", main=title_ov, border = "white",
+     xlab="Overall completeness", xlim=c(0, max(overall_vals, na.rm=TRUE)),
+     ylab = NA)
+par(op)
+
+```
+
+```{r completeness_from_file_summary, results='asis'}
+have_sp   <- sum(is.finite(comp_df$spatial))
+have_tp   <- sum(is.finite(comp_df$temporal))
+have_both <- sum(both_ok)
+
+# Medians + SD
+ms <- if (have_both) round(median(comp_df$spatial[both_ok],  na.rm = TRUE)) else NA
+mt <- if (have_both) round(median(comp_df$temporal[both_ok], na.rm = TRUE)) else NA
+sd_sp <- if (have_both) round(sd(comp_df$spatial[both_ok], na.rm = TRUE), 1) else NA
+sd_tp <- if (have_both) round(sd(comp_df$temporal[both_ok], na.rm = TRUE), 1) else NA
+
+# Thresholds ≥ 75%
+n_sp75 <- sum(comp_df$spatial >= 0.75, na.rm = TRUE)
+n_tp75 <- sum(comp_df$temporal >= 0.75, na.rm = TRUE)
+
+fmt_all <- function(n, total){
+  if (n == total) return("all") else return(fmt_int(n))
+}
+
+txt <- paste0(
+  "**Summary.** We have spatial completeness for ", fmt_all(have_sp, n_total2),
+  " indicators, temporal for ", fmt_all(have_tp, n_total2),
+  ", and overall completeness measured for ", fmt_all(have_both, n_total2), ". ",
+  "Among indicators with both dimensions, the median spatial completeness is **", ms, "% (±", sd_sp, ")**, ",
+  "and the median temporal completeness is **", mt, "% (±", sd_tp, ")**. ",
+  "The temporal completeness is calculated against a 10-year goal for time series length ",
+  "and may therefore exceed 100% (e.g. a complete 20-year time series corresponds to 200%). ",
+  "We have **", fmt_int(n_sp75), "** indicators with spatial completeness above 75% ",
+  "and **", fmt_int(n_tp75), "** indicators with temporal completeness above 75%. ",
+  "In the Annex, a [table](#table-completeness) presents the top 30 indicators with the highest overall completeness."
+)
+
+knitr::asis_output(paste0(txt, "\n\n"))
+```
+
+## Spatial vs temporal completeness
+
+```{r completeness_scatter, fig.width=11, fig.height=7}
+ok <- both_ok
+if (any(ok)){
+  op <- par(mar = c(5,5,3,2), bty = "n")
+  plot(comp_df$temporal[ok], comp_df$spatial[ok],
+       pch = 19, cex = 1.1, col = topic_palette[comp_df$topic[ok]],
+       xlab = "Temporal completeness (%)",
+       ylab = "Spatial completeness (%)",
+       main = paste0("Spatial vs temporal completeness (n=", length(comp_df$temporal[ok]), ")"))
+  grid(col = "#dddddd")
+  legend("topleft", legend = names(topic_palette), col = topic_palette, pch = 19, cex = 0.7, bty = "n")
+  par(op)
+} else {
+  plot.new(); title(main = "Spatial vs temporal completeness"); mtext("No indicators with both dimensions documented", side = 3, line = -1)
+}
+```
+
+```{r completeness_scatter_takeaway, results='asis'}
+ok <- both_ok
+if (any(ok)){
+  high_sp <- comp_df$spatial[ok]  >= 0.75
+  high_tp <- comp_df$temporal[ok] >= 0.75
+  n_high  <- sum(high_sp & high_tp)
+  n_low   <- sum(!high_sp & !high_tp)
+  knitr::asis_output(paste0("**Takeaway.** ", fmt_int(n_high), " indicators are strong on both dimensions (≥75%), while ",
+                            fmt_int(n_low), " are weak on both.\n\n"))
+}
+```
+
+## Overall completeness
+
+```{r completeness_all_topic_box, fig.width=12, fig.height=7}
+# Boxplot by topic using the "Completeness" column (% already), with fallback
+
+nm <- names(ind)
+col_comp <- ds_pick_col(nm, c("^completeness$", "composite", "overall.*complete"))
+
+if (!is.na(col_comp) && col_comp %in% nm) {
+  # --- Use the Completeness column (already in %) ---
+  comp_vals <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", ind[[col_comp]])))
+  ok_comp   <- is.finite(comp_vals)
+  
+  # Topic vector (clean)
+  topics_all <- if (exists("topic_vec")) topic_vec else {
+    v <- if ("topic" %in% nm) as.character(ind[["topic"]]) else rep("Unknown", nrow(ind))
+    v[is.na(v) | v == ""] <- "Unknown"; v
+  }
+  
+  y <- comp_vals[ok_comp]
+  topics_ok <- topics_all[ok_comp]
+  
+  # Order topics by descending median completeness
+  med_by_topic <- tapply(y, topics_ok, median, na.rm = TRUE)
+  med_by_topic <- med_by_topic[is.finite(med_by_topic)]
+  ord <- names(sort(med_by_topic, decreasing = TRUE))
+  
+  # Groups
+  x_fac <- factor(topics_ok, levels = ord)
+  grp   <- split(y, x_fac, drop = TRUE)
+  n_by  <- sapply(grp, function(v) sum(is.finite(v)))
+  
+  # Colours
+  cols <- if (exists("topic_palette") && length(topic_palette)) topic_palette[ord] else rep("grey70", length(ord))
+  cols[is.na(cols)] <- "black"
+  
+  # Labels
+  labels <- paste0(ord, "  (n=", as.integer(n_by), ")")
+  
+  op <- par(mar = c(5, 16, 3, 2), bty = "n")
+  boxplot(grp,
+          horizontal = TRUE,
+          names      = labels,
+          las        = 1,
+          col        = cols,
+          border     = "black",
+          outline    = FALSE,
+          xlab       = "Composite completeness (%)",
+          main       = "Composite completeness by topic",
+          boxlty     = 1,   # solid box borders
+          medlty     = 1,   # solid median line
+          whisklty   = 1,   # solid whiskers
+          staplelty  = 0    # remove staples
+  )
+  par(op)
+  
+} else {
+  # --- Fallback: average of spatial & temporal ---
+  ok <- exists("both_ok") && any(both_ok)
+  if (ok){
+    comb <- (comp_df$spatial[both_ok] + comp_df$temporal[both_ok]) / 2 * 100
+    topics_ok <- comp_df$topic[both_ok]
+    y <- comb
+    
+    med_by_topic <- tapply(y, topics_ok, median, na.rm = TRUE)
+    med_by_topic <- med_by_topic[is.finite(med_by_topic)]
+    ord <- names(sort(med_by_topic, decreasing = TRUE))
+    
+    x_fac <- factor(topics_ok, levels = ord)
+    grp   <- split(y, x_fac, drop = TRUE)
+    n_by  <- sapply(grp, function(v) sum(is.finite(v)))
+    
+    cols <- if (exists("topic_palette") && length(topic_palette)) topic_palette[ord] else rep("grey70", length(ord))
+    cols[is.na(cols)] <- "black"
+    
+    labels <- paste0(ord, "  (n=", as.integer(n_by), ")")
+    
+    op <- par(mar = c(5, 16, 3, 2), bty = "n")
+    boxplot(grp,
+            horizontal = TRUE,
+            names      = labels,
+            las        = 1,
+            col        = cols,
+            border     = "black",
+            outline    = FALSE,
+            xlab       = "Average completeness (%)",
+            main       = "Average (spatial & temporal) by topic",
+            boxlty     = 1,
+            medlty     = 1,
+            whisklty   = 1,
+            staplelty  = 0
+    )
+    par(op)
+  } else {
+    plot.new(); title(main = "Composite completeness by topic")
+    mtext("No 'Completeness' column found and no spatial+temporal fallback available.", side = 3, line = -1)
+  }
+}
+```
+**Note.** In a boxplot, the box represents the interquartile range (the middle 50% of the values), and the horizontal line inside the box marks the median. The whiskers extend to the smallest and largest values that are not considered statistical outliers. Points beyond the whiskers are usually plotted individually as outliers (not shown here).
+
+```{r completeness_topic_box, fig.width=12, fig.height=7}
+# Boxplot by topic using the "Completeness" column (% already), EXCLUDING zeros
+
+nm <- names(ind)
+col_comp <- ds_pick_col(nm, c("^completeness$", "composite", "overall.*complete"))
+
+if (!is.na(col_comp) && col_comp %in% nm) {
+  # --- Use the Completeness column (already in %) ---
+  comp_vals <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", ind[[col_comp]])))
+  ok_comp   <- is.finite(comp_vals) & comp_vals > 0   # <<< exclude zeros
+  
+  # Topic vector (clean)
+  topics_all <- if (exists("topic_vec")) topic_vec else {
+    v <- if ("topic" %in% nm) as.character(ind[["topic"]]) else rep("Unknown", nrow(ind))
+    v[is.na(v) | v == ""] <- "Unknown"; v
+  }
+  
+  y <- comp_vals[ok_comp]
+  topics_ok <- topics_all[ok_comp]
+  
+  # Order topics by descending median completeness
+  med_by_topic <- tapply(y, topics_ok, median, na.rm = TRUE)
+  med_by_topic <- med_by_topic[is.finite(med_by_topic)]
+  ord <- names(sort(med_by_topic, decreasing = TRUE))
+  
+  # Groups
+  x_fac <- factor(topics_ok, levels = ord)
+  grp   <- split(y, x_fac, drop = TRUE)
+  n_by  <- sapply(grp, function(v) sum(is.finite(v)))
+  
+  # Colours
+  cols <- if (exists("topic_palette") && length(topic_palette)) topic_palette[ord] else rep("grey70", length(ord))
+  cols[is.na(cols)] <- "black"
+  
+  # Labels
+  labels <- paste0(ord, "  (n=", as.integer(n_by), ")")
+  
+  op <- par(mar = c(5, 16, 3, 2), bty = "n")
+  boxplot(grp,
+          horizontal = TRUE,
+          names      = labels,
+          las        = 1,
+          col        = cols,
+          border     = "black",
+          outline    = FALSE,
+          xlab       = "Composite completeness (%)",
+          main       = "Composite completeness by topic (excluding 0%)",
+          boxlty     = 1,   # solid box borders
+          medlty     = 1,   # solid median line
+          whisklty   = 1,   # solid whiskers
+          staplelty  = 0    # remove staples
+  )
+  par(op)
+  
+} else {
+  # --- Fallback: average of spatial & temporal ---
+  ok <- exists("both_ok") && any(both_ok)
+  if (ok){
+    comb <- (comp_df$spatial[both_ok] + comp_df$temporal[both_ok]) / 2 * 100
+    ok_comb <- is.finite(comb) & comb > 0   # <<< exclude zeros
+    topics_ok <- comp_df$topic[both_ok][ok_comb]
+    y <- comb[ok_comb]
+    
+    med_by_topic <- tapply(y, topics_ok, median, na.rm = TRUE)
+    med_by_topic <- med_by_topic[is.finite(med_by_topic)]
+    ord <- names(sort(med_by_topic, decreasing = TRUE))
+    
+    x_fac <- factor(topics_ok, levels = ord)
+    grp   <- split(y, x_fac, drop = TRUE)
+    n_by  <- sapply(grp, function(v) sum(is.finite(v)))
+    
+    cols <- if (exists("topic_palette") && length(topic_palette)) topic_palette[ord] else rep("grey70", length(ord))
+    cols[is.na(cols)] <- "black"
+    
+    labels <- paste0(ord, "  (n=", as.integer(n_by), ")")
+    
+    op <- par(mar = c(5, 16, 3, 2), bty = "n")
+    boxplot(grp,
+            horizontal = TRUE,
+            names      = labels,
+            las        = 1,
+            col        = cols,
+            border     = "black",
+            outline    = FALSE,
+            xlab       = "Average completeness (%)",
+            main       = "Average (spatial & temporal) by topic (excluding 0%)",
+            boxlty     = 1,
+            medlty     = 1,
+            whisklty   = 1,
+            staplelty  = 0
+    )
+    par(op)
+  } else {
+    plot.new(); title(main = "Composite completeness by topic")
+    mtext("No 'Completeness' column found and no spatial+temporal fallback available.", side = 3, line = -1)
+  }
+}
+```
+
+```{r completeness_topic_takeaway, results='asis'}
+# Robust parsing of "Completeness" to percent
+parse_percent <- function(x){
+  v <- suppressWarnings(as.numeric(x))
+  if (all(is.na(v))) v <- suppressWarnings(as.numeric(gsub("[^0-9.]+","", as.character(x))))
+  if (any(is.finite(v)) && max(v, na.rm = TRUE) <= 1.2) v <- v * 100  # proportions -> %
+  v
+}
+
+# Pick columns
+nm <- names(ind)
+col_comp <- grep("^completeness$", nm, ignore.case = TRUE, value = TRUE)[1]
+if (is.na(col_comp)) { knitr::asis_output("No 'Completeness' column found.\n\n"); knitr::knit_exit() }
+
+# Values & topics
+vals <- parse_percent(ind[[col_comp]])
+topics <- if ("topic" %in% nm) as.character(ind[["topic"]]) else rep("Unknown", length(vals))
+topics[is.na(topics) | topics == ""] <- "Unknown"
+
+# Helper: summarise best topic (highest median) within a mask
+summ_case <- function(vals, topics, mask){
+  if (!any(mask)) return(NULL)
+  meds <- tapply(vals[mask & is.finite(vals)], topics[mask & is.finite(vals)], median, na.rm = TRUE)
+  meds <- meds[is.finite(meds)]
+  if (!length(meds)) return(NULL)
+  best_topic <- names(sort(meds, decreasing = TRUE))[1]
+  best_median <- meds[[best_topic]]
+  in_best <- mask & topics == best_topic & is.finite(vals)
+  best_sd <- sd(vals[in_best], na.rm = TRUE)
+  n_best <- sum(in_best, na.rm = TRUE)
+  list(topic = best_topic, median = best_median, sd = best_sd, n = n_best)
+}
+
+# Masks
+mask_all  <- is.finite(vals)                   # availability: zeros included
+mask_non0 <- is.finite(vals) & vals > 0        # coverage: zeros excluded
+
+res_all  <- summ_case(vals, topics, mask_all)
+res_non0 <- summ_case(vals, topics, mask_non0)
+
+# Intro explanation
+knitr::asis_output(
+  "We report two complementary views. **Data potential** treats completeness, whether an indicator exists/is defined (zeros included). **Data coverage** focuses on how much data are available among indicators (zeros excluded).\n\n"
+)
+
+fmt_line <- function(tag, res){
+  if (is.null(res)) return(NULL)
+  med_txt <- sprintf("%.1f", res$median)
+  sd_txt  <- if (is.finite(res$sd)) sprintf("%.1f", res$sd) else "0.0"
+  paste0("**", tag, ".** Most complete topic: **", res$topic,
+         "** - median **", med_txt, "% (±", sd_txt, ")**, based on **n=", res$n, "** indicators.\n\n")
+}
+
+if (!is.null(res_all))  knitr::asis_output(fmt_line("Potential (zeros included)", res_all))
+if (!is.null(res_non0)) knitr::asis_output(fmt_line("Coverage (zeros excluded)",   res_non0))
+
+```
+
+
+
+
+## Completeness and data sources
+
+Indicator completeness often varies by data source. Where robust monitoring systems exist-with clear standards, routine reporting, and stable pipelines-indicators derived from them tend to be more fully populated. By contrast, indicators based on administrative records can lag despite widespread collection, because access may be constrained by data-protection rules, legal mandates, fragmentation across custodians, or limited interoperability. These dynamics vary by country and sector but help explain systematic differences in completeness across sources.
+
+```{r completeness_source_donuts_box, fig.width=12, fig.height=7}
+nm <- names(ind)
+
+# helpers (only if missing)
+if (!exists("ds_pick_col")) {
+  ds_pick_col <- function(nm, patterns){
+    for (pt in patterns){
+      i <- which(grepl(pt, nm, ignore.case = TRUE))[1]
+      if (!is.na(i)) return(nm[i])
+    }
+    NA_character_
+  }
+}
+if (!exists("ds_split_multi")) ds_split_multi <- function(x) unlist(strsplit(as.character(x), "\\s*[,;|/]\\s*"))
+if (!exists("ds_norm"))        ds_norm        <- function(x) trimws(tolower(as.character(x)))
+
+col_comp  <- "completeness"
+col_dtype <- if (exists("col_dtype")) col_dtype else ds_pick_col(nm, c("data[_ ]?source","source","dtype"))
+
+if (!is.na(col_comp) && col_comp %in% nm && !is.na(col_dtype) && col_dtype %in% nm) {
+  comp_vals <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", ind[[col_comp]])))
+
+  # long form (source ↔ indicator)
+  dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals <- unlist(dt_list, use.names = FALSE)
+  dt_id   <- rep(seq_len(nrow(ind)), times = sapply(dt_list, length))
+  dl <- data.frame(id = dt_id, type = ds_norm(dt_vals), stringsAsFactors = FALSE)
+
+  dl$completeness <- comp_vals[dl$id]
+  dl <- dl[is.finite(dl$completeness), , drop = FALSE]
+
+  if (nrow(dl)) {
+    # palette (reuse existing if defined)
+    types_all <- sort(unique(dl$type))
+    pal_all <- if (exists("pal_dtype_all")) {
+      rep(pal_dtype_all, length.out = length(types_all))
+    } else if (exists("pal_dtype4")) {
+      rep(pal_dtype4, length.out = length(types_all))
+    } else {
+      grDevices::rainbow(max(length(types_all), 3))
+    }
+    col_map <- stats::setNames(pal_all[seq_along(types_all)], types_all)
+    lighten <- function(hex){ rgbv <- col2rgb(hex); rgb((rgbv[1]+255)/2, (rgbv[2]+255)/2, (rgbv[3]+255)/2, maxColorValue = 255) }
+
+    # order by median completeness among non-zero values
+    dl_nz  <- dl[dl$completeness > 0, , drop = FALSE]
+    med_by <- tapply(dl_nz$completeness, dl_nz$type, median, na.rm = TRUE)
+    med_by <- med_by[is.finite(med_by)]
+    ord    <- unique(c(names(sort(med_by, decreasing = TRUE)), setdiff(types_all, names(med_by))))
+
+    # ===== layout: title row (donuts), donuts row, legend row, boxplot row
+    k <- length(ord)
+    lay <- rbind(rep(1, k),            # row 1: donuts title (single cell spanning k cols)
+                 2:(k+1),              # row 2: k donuts
+                 rep(k+2, k),          # row 3: unified legend
+                 rep(k+3, k))          # row 4: boxplot
+    layout(lay, heights = c(.05, .3, .05, .6))
+
+    ## --- row 1: single title for donuts
+    par(mar = c(0,0,2,0), bty = "n"); plot.new()
+    title(main = "Indicators with / without completeness by data source", cex.main = 1.2)
+
+    ## --- row 2: donuts (equal size, same order as boxplot)
+    par(mar = c(2,2,2,2), bty = "n")
+    for (tp in ord) {
+      z  <- sum(dl$type == tp & dl$completeness == 0, na.rm = TRUE)
+      nz <- sum(dl$type == tp & dl$completeness  > 0, na.rm = TRUE)
+      cols <- c(lighten(col_map[tp]), col_map[tp])
+      pie(c(z, nz), col = cols, border = "black", labels = NA)
+      symbols(0, 0, circles = 0.30, inches = FALSE, add = TRUE, bg = "white")  # donut hole
+      mtext(side = 3, line = 0.3, at = 0, text = paste0(tp, " (n=", z + nz, ")"), cex = 0.9)
+    }
+
+    ## --- row 3: unified legend for donuts
+    par(mar = c(0,0,0,0), bty = "n"); plot.new()
+    legend("center",
+           legend = c("Completeness = 0", "Completeness > 0"),
+           fill   = c("snow2", "snow4"),
+           border = NA, bty = "n", horiz = TRUE, cex = 1.3)
+
+    ## --- row 4: vertical boxplot (exclude zero completeness), no outliers, no frame
+    if (nrow(dl_nz)) {
+      n_by  <- table(dl_nz$type)
+      y_max <- max(dl_nz$completeness, na.rm = TRUE)
+      par(mar = c(6, 4, 4, 1), bty = "n")
+      boxplot(completeness ~ factor(type, levels = ord), data = dl_nz,
+              horizontal = FALSE,
+              col = col_map[ord],
+              border = "black",
+              boxlty = 1, medlty = 1, whisklty = 1, staplelty = 0,
+              outline = FALSE, 
+              names = paste0(ord, " (n=", n_by[ord], ")"),
+              ylim = c(0, y_max),
+              ylab = "Global completeness (%)",
+              xlab = "",
+              main = "Global completeness by data source (excluding 0%)")
+    } else {
+      par(mar = c(0,0,3,0), bty = "n"); plot.new(); title(main = "No non-zero completeness values to plot")
+    }
+  } else {
+    plot.new(); title(main = "No valid completeness × source data to plot")
+  }
+} else {
+  plot.new(); title(main = "Missing 'completeness' or 'data source' column")
+}
+```
+
+```{r completeness_source_takeaway, results='asis'}
+# Helpers (base R only)
+if (!exists("ds_pick_col")) {
+  ds_pick_col <- function(nm, patterns){
+    for (pt in patterns){
+      i <- which(grepl(pt, nm, ignore.case = TRUE))[1]
+      if (!is.na(i)) return(nm[i])
+    }
+    NA_character_
+  }
+}
+if (!exists("ds_split_multi")) ds_split_multi <- function(x) unlist(strsplit(as.character(x), "\\s*[,;|/]\\s*"))
+if (!exists("ds_norm"))        ds_norm        <- function(x) trimws(tolower(as.character(x)))
+if (!exists("ds_titlecase"))   ds_titlecase   <- function(x) {
+  x <- as.character(x); gsub("(^|[[:space:]]+)([[:alpha:]])","\\1\\U\\2", tolower(x), perl=TRUE)
+}
+if (!exists("fmt_int"))        fmt_int        <- function(x) formatC(as.integer(x), format="d", big.mark=",")
+
+nm <- names(ind)
+col_comp  <- "completeness"
+col_dtype <- if (exists("col_dtype")) col_dtype else ds_pick_col(nm, c("data[_ ]?source","source","dtype"))
+
+if (!is.na(col_comp) && col_comp %in% nm && !is.na(col_dtype) && col_dtype %in% nm) {
+  # Parse completeness (already %; just strip any non-numeric)
+  comp_vals <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", ind[[col_comp]])))
+
+  # Long form for sources
+  dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+  dt_vals <- unlist(dt_list, use.names = FALSE)
+  dt_id   <- rep(seq_len(nrow(ind)), times = sapply(dt_list, length))
+  df <- data.frame(id = dt_id, type = ds_norm(dt_vals), stringsAsFactors = FALSE)
+
+  # Attach completeness and keep finite
+  df$completeness <- comp_vals[df$id]
+  df <- df[is.finite(df$completeness), , drop = FALSE]
+
+  if (nrow(df)) {
+    # Totals & zeros by source
+    tot_by   <- table(df$type)
+    zero_by  <- tapply(df$completeness == 0, df$type, sum, na.rm = TRUE)
+    zero_by  <- zero_by[match(names(tot_by), names(zero_by))]; zero_by[is.na(zero_by)] <- 0
+    nonzero_by <- tot_by - zero_by
+
+    # Stats among non-zero completeness (aligns with the boxplot)
+    ok_nz  <- df$completeness > 0
+    # medians
+    med_nz <- tapply(df$completeness[ok_nz], df$type[ok_nz], median, na.rm = TRUE)
+    med_nz <- med_nz[is.finite(med_nz)]
+    # standard deviations (robust to singletons => 0)
+    sd_nz  <- tapply(df$completeness[ok_nz], df$type[ok_nz],
+                     function(v){ v <- v[is.finite(v)]; if (length(v) <= 1) 0 else stats::sd(v, na.rm = TRUE) })
+
+    # Identify top 1–2 by median completeness
+    ord <- names(sort(med_nz, decreasing = TRUE))
+    top1 <- ord[1]; top2 <- if (length(ord) >= 2) ord[2] else NA
+
+    top1_txt <- paste0("**", ds_titlecase(top1), "** (median ",
+                       round(med_nz[top1]), "% ± ", round(sd_nz[top1], 1),
+                       "; n=", fmt_int(nonzero_by[top1]), ")")
+    top2_txt <- if (!is.na(top2)) {
+      paste0(" and **", ds_titlecase(top2), "** (median ",
+             round(med_nz[top2]), "% ± ", round(sd_nz[top2], 1),
+             "; n=", fmt_int(nonzero_by[top2]), ")")
+    } else ""
+
+    # Conditional Survey note (if Survey underperforms relative to the median of medians)
+    survey_key <- names(med_nz)[tolower(names(med_nz)) %in% c("survey","surveys")]
+    survey_note <- ""
+    if (length(survey_key)) {
+      m_survey <- med_nz[survey_key[1]]; sd_survey <- sd_nz[survey_key[1]]
+      bench    <- median(as.numeric(med_nz), na.rm = TRUE)
+      if (is.finite(m_survey) && m_survey < bench) {
+        survey_note <- paste0(
+          " Although **Survey** currently shows a lower median completeness (",
+          round(m_survey), "% ± ", round(sd_survey, 1),
+          "; zeros ", round(100 * (zero_by[survey_key[1]]/tot_by[survey_key[1]])), "%), ",
+          "SDD holds extensive microdata, suggesting **quick gains** are feasible for survey-based indicators."
+        )
+      }
+    }
+
+    # Compose and print
+    txt <- paste0(
+      "**Takeaway.** Considering indicators with non-zero completeness, the most complete data sources are ",
+      top1_txt, top2_txt, ". ",
+      survey_note
+    )
+    knitr::asis_output(paste0(txt, "\n\n"))
+  } else {
+    knitr::asis_output("_No valid completeness × source data available for a takeaway._\n\n")
+  }
+} else {
+  knitr::asis_output("_Missing 'completeness' or 'data source' column; takeaway skipped._\n\n")
+}
+```
+## Take away
+```{r completeness_final_takeaways, results='asis'}
+# --- helpers (base R) ---
+if (!exists("fmt_int")) fmt_int <- function(x) formatC(as.integer(x), format="d", big.mark=",")
+if (!exists("ds_pick_col")) {
+  ds_pick_col <- function(nm, patterns){
+    for (pt in patterns){
+      i <- which(grepl(pt, nm, ignore.case=TRUE))[1]
+      if (!is.na(i)) return(nm[i])
+    }
+    NA_character_
+  }
+}
+if (!exists("ds_split_multi")) ds_split_multi <- function(x) unlist(strsplit(as.character(x), "\\s*[,;|/]\\s*"))
+if (!exists("ds_norm"))        ds_norm        <- function(x) trimws(tolower(as.character(x)))
+
+# Robust read of overall completeness as percent (numeric, "85%", or proportion 0–1)
+parse_percent <- function(x){
+  v <- suppressWarnings(as.numeric(x))
+  if (all(is.na(v))) v <- suppressWarnings(as.numeric(gsub("[^0-9.]+","", as.character(x))))
+  if (any(is.finite(v)) && max(v, na.rm=TRUE) <= 1.2) v <- v * 100  # proportions -> %
+  v
+}
+
+nm <- names(ind)
+n_total <- nrow(ind)
+
+# Overall completeness (column only; no recomputation)
+col_overall <- "completeness"
+if (!(col_overall %in% nm)) {
+  knitr::asis_output("_No 'completeness' column found; final takeaway skipped._\n\n")
+} else {
+  overall <- parse_percent(ind[[col_overall]])
+
+  # Keep only indicators with non-zero overall completeness
+  keep <- is.finite(overall) & overall > 0
+  n_keep <- sum(keep, na.rm = TRUE)
+
+  # Spatial & temporal for joint >=75% (prefer comp_df; else fallback)
+  if (exists("comp_df")) {
+    sp <- comp_df$spatial; tp <- comp_df$temporal  # 0–1
+  } else {
+    col_spatial  <- ds_pick_col(nm, c("^spatial[ _-]?completeness$", "spatial.*complet|geo.*cover|country.*cover|spc.*cover"))
+    col_temporal <- ds_pick_col(nm, c("^temporal[ _-]?completeness$", "temporal.*complet|time.*complet|year.*complet"))
+    scale01 <- function(x){ x <- suppressWarnings(as.numeric(gsub("%","", x))); if (any(x > 1, na.rm=TRUE)) x <- x/100; pmax(0, pmin(1, x)) }
+    sp <- if (!is.na(col_spatial))  scale01(ind[[col_spatial]])  else rep(NA_real_, n_total)
+    tp <- if (!is.na(col_temporal)) scale01(ind[[col_temporal]]) else rep(NA_real_, n_total)
+  }
+
+  # Counts on the filtered set (overall > 0)
+  n_joint75   <- sum(keep & sp >= 0.75 & tp >= 0.75, na.rm = TRUE)
+  n_overall75 <- sum(keep & overall >= 75, na.rm = TRUE)
+
+  # Tone based on share within the filtered set
+  prop_overall75 <- if (n_keep > 0) n_overall75 / n_keep else NA_real_
+  tone <- if (!is.finite(prop_overall75)) {
+    ""
+  } else if (prop_overall75 >= 0.60) {
+    "- which is very encouraging."
+  } else if (prop_overall75 >= 0.35) {
+    "- which is encouraging."
+  } else if (prop_overall75 >= 0.15) {
+    "- which is uneven but promising."
+  } else {
+    "- which suggests substantial room for improvement."
+  }
+
+  # Topic highlights (medians of overall %, filtered to overall > 0)
+  topics <- if ("topic" %in% nm) as.character(ind[["topic"]]) else rep("Unknown", n_total)
+  topics[is.na(topics) | topics==""] <- "Unknown"
+
+  med_by_topic <- tapply(overall[keep], topics[keep], function(v) median(v, na.rm=TRUE))
+  med_by_topic <- med_by_topic[is.finite(med_by_topic)]
+  ord <- names(sort(med_by_topic, decreasing = TRUE))
+  med_ord <- as.numeric(sort(med_by_topic, decreasing = TRUE))
+
+  top_list <- function(ord, med_ord){
+    k <- length(ord)
+    if (k >= 3) {
+      if ((med_ord[2] - med_ord[3]) >= 5) paste0(ord[1], ", ", ord[2], " and, to a lesser extent, ", ord[3])
+      else paste0(ord[1], ", ", ord[2], " and ", ord[3])
+    } else if (k == 2) paste0(ord[1], " and ", ord[2])
+    else if (k == 1) ord[1] else "-"
+  }
+
+  # Compose the main paragraph
+  txt <- paste0(
+    "Out of the ", fmt_int(n_keep), " indicators with non-zero overall completeness (out of ",
+    fmt_int(n_total), " total), **", fmt_int(n_joint75),
+    "** have both temporal completeness and spatial completeness above 75%, and **",
+    fmt_int(n_overall75), "** have an overall completeness at or above 75% ", tone, " ",
+    "Some topics are more complete than others on overall completeness, notably ",
+    top_list(ord, med_ord), "."
+  )
+
+  # ---- Optional add-on: flag if SURVEY appears underused ----
+  col_dtype <- if (exists("col_dtype")) col_dtype else ds_pick_col(nm, c("data[_ ]?source","source","dtype"))
+  if (!is.na(col_dtype) && col_dtype %in% nm) {
+    # Build long mapping of sources to overall completeness
+    dt_list <- lapply(ind[[col_dtype]], ds_split_multi)
+    dt_vals <- unlist(dt_list, use.names = FALSE)
+    dt_id   <- rep(seq_len(n_total), times = sapply(dt_list, length))
+    src_df  <- data.frame(id = dt_id, src = ds_norm(dt_vals), stringsAsFactors = FALSE)
+    src_df$ov <- overall[src_df$id]
+    src_df <- src_df[is.finite(src_df$ov), , drop = FALSE]
+
+    if (nrow(src_df)) {
+      tot_by   <- table(src_df$src)
+      zero_by  <- tapply(src_df$ov == 0, src_df$src, sum, na.rm = TRUE)
+      zero_by  <- zero_by[match(names(tot_by), names(zero_by))]; zero_by[is.na(zero_by)] <- 0
+      nonzero_by <- tot_by - zero_by
+
+      med_nz <- tapply(src_df$ov[src_df$ov > 0], src_df$src[src_df$ov > 0], median, na.rm = TRUE)
+      med_nz <- med_nz[is.finite(med_nz)]
+      sd_nz  <- tapply(src_df$ov[src_df$ov > 0], src_df$src[src_df$ov > 0],
+                       function(v){ v <- v[is.finite(v)]; if (length(v) <= 1) 0 else stats::sd(v, na.rm = TRUE) })
+
+      survey_key <- names(tot_by)[tolower(names(tot_by)) %in% c("survey","surveys")]
+      if (length(survey_key)) {
+        key <- survey_key[1]
+        m_s  <- as.numeric(med_nz[key]); sd_s <- as.numeric(sd_nz[key])
+        z_rt <- if (tot_by[key] > 0) as.numeric(zero_by[key] / tot_by[key]) else NA_real_
+        bench <- median(as.numeric(med_nz), na.rm = TRUE)
+
+        if (is.finite(m_s) && m_s < bench) {
+          txt <- paste0(
+            txt, " **Survey appears underused** (median ", round(m_s),
+            "% ± ", round(sd_s, 1), "; zeros ", round(100 * z_rt), "%). ",
+            "Given SDD’s extensive microdata holdings, survey-based indicators are strong candidates for early improvement."
+          )
+        }
+      }
+    }
+  }
+
+  knitr::asis_output(paste0(txt, "\n\n"))
+}
+```
+
+
+# V. Priority
+Defining priorities is inherently complex and involves a certain degree of arbitrariness - which should align with the end goal. To mitigate this, the approach used here is described in detail to ensure transparency, reproducibility, and to invite constructive feedback.
+
+The immediate objective is to identify and populate indicators for the 2026 edition of the DataViz Challenge, supported by SPC. To deliver a dataset that is both relevant for participants and strategically valuable for member countries, completeness is treated as the primary criterion. At the same time, indicators are weighted by their utility and strategic relevance:
+
+- those aligned across multiple frameworks,
+- those serving several SPC divisions, and
+- those linked to mandatory rather than voluntary reporting obligations.
+
+Given the tight timeline, data availability is also decisive. Indicators for which data are currently unobtainable cannot realistically be prioritised in the short term. However, low availability should not be seen only as a constraint: it also flags longer-term opportunities for investment, pointing to areas where building systems and improving access could yield high returns in future iterations.
+
+## Points-based priority
+
+```{r priority_setup_features_rev, include=FALSE}
+# Vector-safe splitter: returns a character vector for a single string,
+# and a list of character vectors for a vector input.
+ds_split_multi <- function(x){
+  # If vector of length > 1: apply recursively element-wise and return a list
+  if (length(x) > 1) return(lapply(as.character(x), ds_split_multi))
+  # Now treat length-1 scalars (including NA/"")
+  if (length(x) == 0 || is.na(x) || !nzchar(x)) return(character(0))
+  x0 <- tolower(as.character(x))
+  x0 <- gsub("\r|\n", " ", x0)
+  x0 <- gsub("\\band\\b", ";", x0)
+  x0 <- gsub("&|\u2013|\u2014|\u2010|\u2212", ";", x0)
+  parts <- unlist(strsplit(x0, "[;,/|]+"))
+  parts <- trimws(parts)
+  parts[nzchar(parts)]
+}
+
+# ---------- Helpers (use existing if present) ----------
+if (!exists("ds_pick_col")) {
+  ds_pick_col <- function(nm, patterns){
+    for (pt in patterns){
+      i <- which(grepl(pt, nm, ignore.case = TRUE))[1]
+      if (!is.na(i)) return(nm[i])
+    }
+    NA_character_
+  }
+}
+if (!exists("ds_split_multi")) {
+  ds_split_multi <- function(x){
+    if (is.na(x) || !nzchar(x)) return(character(0))
+    x0 <- tolower(x)
+    x0 <- gsub("\r|\n", " ", x0)
+    x0 <- gsub("\\band\\b", ";", x0)
+    x0 <- gsub("&|\u2013|\u2014|\u2010|\u2212", ";", x0)
+    parts <- unlist(strsplit(x0, "[;,/|]+"))
+    parts <- trimws(parts)
+    parts[nzchar(parts)]
+  }
+}
+if (!exists("ds_titlecase")) {
+  .ds_acr <- c("spc","sprep","un","undp","undrr","unfccc","ipcc","fao","imf","oecd","ilo","who","wmo","wb",
+               "wbg","adb","esa","nasa","sdg","unep","unsd","unescap","unicef","faostat")
+  ds_titlecase <- function(x){
+    if (is.na(x) || !nzchar(x)) return(x)
+    w <- strsplit(tolower(x), " ")[[1]]
+    small <- c("and","or","of","the","a","an","to","for","in","on","by","with","at","from","vs","per","de")
+    up <- function(s){
+      if (s %in% .ds_acr) return(toupper(s))
+      parts <- strsplit(s, "-")[[1]]
+      parts <- ifelse(nchar(parts)==0, parts, paste0(toupper(substr(parts,1,1)), substr(parts,2,nchar(parts))))
+      paste(parts, collapse="-")
+    }
+    out <- character(length(w))
+    for (i in seq_along(w)) out[i] <- if (i>1 && w[i] %in% small) w[i] else up(w[i])
+    paste(out, collapse=" ")
+  }
+}
+if (!exists("ds_titlecase_vec")) {
+  ds_titlecase_vec <- function(x) {
+    vapply(x, function(s) {
+      if (is.na(s) || !nzchar(s)) return(s)
+      ds_titlecase(s)
+    }, character(1))
+  }
+}
+if (!exists("ds_trunc")) {
+  ds_trunc <- function(x, n=60){ ifelse(nchar(x)>n, paste0(substr(x,1,n-1),"…"), x) }
+}
+if (!exists("fmt_int")) { fmt_int <- function(x) format(as.integer(x), big.mark=",", trim=TRUE) }
+if (!exists("fmt_pct")) { fmt_pct <- function(num, den) ifelse(den>0, paste0(round(100*num/den), "%"), "n/a") }
+
+scale01 <- function(x){
+  x <- suppressWarnings(as.numeric(gsub("%","", x)))
+  x[!is.finite(x)] <- NA_real_
+  if (any(x > 1, na.rm=TRUE)) x <- x/100
+  pmax(0, pmin(1, x))
+}
+
+# ---------- Column detection ----------
+nm <- names(ind)
+
+col_compl   <- ds_pick_col(nm, c("^completeness$", "overall.*complete"))
+col_spatial <- ds_pick_col(nm, c("^spatial[ _-]?completeness$", "spatial.*complet|geo.*cover|country.*cover|spc.*cover"))
+col_temp    <- ds_pick_col(nm, c("^temporal[ _-]?completeness$", "temporal.*complet|time.*complet|year.*complet"))
+col_source  <- ds_pick_col(nm, c("^data[_ ]?source$", "source", "dataset|platform"))
+col_agency  <- ds_pick_col(nm, c("responsible|custodian|owner|agency"))
+col_spc     <- ds_pick_col(nm, c("^spc[_ ]?division$", "^spc$", "division"))
+col_topic   <- if ("topic" %in% nm) "topic" else ds_pick_col(nm, c("^topic$"))
+col_title   <- ds_pick_col(nm, c("^indicator(_name|_title)?$", "^name$", "^title$"))
+col_id      <- ds_pick_col(nm, c("^indicator[_ ]?id$","^id$","^code$"))
+col_planned <- ds_pick_col(nm, c("planned|pipeline|in[ _-]?progress|will[ _-]?be[ _-]?done|underway|committed"))
+col_obl     <- ds_pick_col(nm, c("reporting.*obligation|obligation|mandatory|requirement"))
+
+# ---------- Canonical vectors ----------
+n_total <- nrow(ind)
+title_vec <- if (!is.na(col_title)) as.character(ind[[col_title]]) else paste("Indicator", seq_len(n_total))
+if (!is.na(col_id)) title_vec <- ifelse(is.na(ind[[col_id]]) | ind[[col_id]]=="", title_vec, paste(ind[[col_id]], title_vec, sep=" - "))
+title_vec[!nzchar(title_vec)] <- paste("Indicator", seq_along(title_vec))
+topic_vec <- if (!is.na(col_topic)) { v <- as.character(ind[[col_topic]]); v[is.na(v)|v==""] <- "Unknown"; v } else rep("Unknown", n_total)
+
+# Completeness from file (use ONLY Completeness col), but treat as NA unless both spatial & temporal exist
+comp_raw <- if (!is.na(col_compl)) scale01(ind[[col_compl]]) else rep(NA_real_, n_total)
+sp_ok    <- if (!is.na(col_spatial)) is.finite(scale01(ind[[col_spatial]])) else FALSE
+tp_ok    <- if (!is.na(col_temp))    is.finite(scale01(ind[[col_temp]]))    else FALSE
+comp_use <- comp_raw
+comp_use[!(sp_ok & tp_ok)] <- NA_real_
+
+# Planned/done flag
+to_bool <- function(x){
+  x <- tolower(trimws(as.character(x)))
+  ifelse(grepl("\\b(yes|y|true|1|planned|in[- _]?progress|underway|will)\\b", x), 1L,
+         ifelse(grepl("\\b(no|n|false|0)\\b", x), 0L, NA_integer_))
+}
+will_done <- if (!is.na(col_planned)) to_bool(ind[[col_planned]]) else rep(0L, n_total)
+
+# Reporting obligation
+obl_raw <- if (!is.na(col_obl)) tolower(trimws(as.character(ind[[col_obl]]))) else rep(NA_character_, n_total)
+obl_points_map <- c("voluntary"=0L, "mandatory"=3L, "treaty-based"=3L, "treaty based"=3L, "country specific"=2L, "country-specific"=2L)
+obl_points <- ifelse(obl_raw %in% names(obl_points_map), obl_points_map[obl_raw], 0L)
+
+# Data source counts
+src_counts <- if (!is.na(col_source)) {
+  lst <- lapply(ind[[col_source]], ds_split_multi)
+  vapply(lst, function(z) length(unique(z)), integer(1))
+} else rep(0L, n_total)
+src_points <- ifelse(src_counts <= 0, 0L, ifelse(src_counts == 1, 3L, 2L))
+
+# SPC divisions (cap at 3)
+div_counts <- if (!is.na(col_spc)) {
+  lst <- lapply(ind[[col_spc]], ds_split_multi)
+  vapply(lst, function(z) length(unique(z)), integer(1))
+} else rep(0L, n_total)
+div_points <- pmin(div_counts, 3L)
+
+# ---------- NEW WEIGHTS per your spec ----------
+# Completeness weight reduced to 4x
+comp_points <- ifelse(is.finite(comp_use), round(4 * comp_use), 0L)  # 0..4
+
+# Total points with override (if will_done==1 → score=0)
+score_components <- cbind(Completeness = comp_points,
+                          Source       = src_points,
+                          Obligation   = as.integer(obl_points),
+                          Divisions    = as.integer(div_points))
+score_points_raw <- rowSums(score_components, na.rm = TRUE)
+score_points     <- ifelse(will_done == 1L, 0L, score_points_raw)
+
+# Normalised percent (0..100) on new max (4+3+3+3 = 13)
+score_points_pct <- round(100 * score_points / 13)
+
+# Priority table
+priority_df <- data.frame(
+  Indicator   = title_vec,
+  Topic       = topic_vec,
+  Completeness= comp_use,
+  WillDone    = will_done,
+  Obligation  = ifelse(is.na(obl_raw), "", ds_titlecase_vec(obl_raw)),
+  SrcCount    = src_counts,
+  DivCount    = div_counts,
+  ScorePoints = as.integer(score_points),
+  ScorePct    = score_points_pct,
+  stringsAsFactors = FALSE
+)
+
+# Save components for plotting (respect override so planned=0 bar)
+score_components_plot <- score_components
+score_components_plot[will_done == 1L, ] <- 0L
+
+# Context stats
+k_done   <- sum(priority_df$WillDone == 1L, na.rm = TRUE)
+k_comp   <- sum(is.finite(priority_df$Completeness))
+k_src1   <- sum(priority_df$SrcCount == 1L, na.rm = TRUE)
+k_srcM   <- sum(priority_df$SrcCount >  1L, na.rm = TRUE)
+k_obl_m  <- sum(tolower(priority_df$Obligation) %in% c("mandatory","treaty-based"), na.rm=TRUE)
+k_div3p  <- sum(priority_df$DivCount >= 3L, na.rm = TRUE)
+
+# Make globals available to later chunks
+priority_components <- score_components_plot
+```
+
+Priorities are set by combining four strategic dimensions with a transparent scoring system:
+
+- **Completeness** (0–4 points) – The central driver of prioritisation. Indicators receive up to 4 points based on their level of completeness (scored as 4 × completeness). Higher completeness means greater immediate usability and comparability.
+- **Data Source** (0–3 points) – Data availability is decisive under a fixed deadline. Indicators score:
+  - +3 if a single, clear source is identified,
+  - +2 if multiple sources are listed,
+  - +0 if no source is known.
+  - Additional bonuses are awarded for sources likely to be quickly usable: +1 for survey-based indicators (given SDD's extensive microdata library) and +1 for monitoring or mapping sources (where systems tend to be well established).
+- **Reporting Obligation** (0–3 points) – Reflects the indicator’s strategic value for countries and SPC:
+  - +3 for mandatory or treaty-based reporting,
+  - +2 for country-specific obligations,
+  - +0 for voluntary indicators.
+- **SPC Divisions** (0–3 points) – To encourage cross-cutting utility, +1 is awarded per SPC division making use of the indicator, capped at 3 points.
+
+**Special rule**: If an indicator is already planned or underway (i.e., SDGs), its priority score is set to 0 to avoid duplication of effort. this might be updated after discussing with SPREP regarding environmental indicators.
+
+The maximum priority score is 15 points, reflecting an indicator that is both complete and strategically valuable.
+
+**Why this matters**. This approach ensures that priorities are:
+
+- **Pragmatic** in the short term – by focusing on indicators that can realistically be delivered for 2026, based on available data and clear reporting needs.
+- **Strategic** in the long term – by flagging areas where low availability highlights opportunities for investment in systems and access, ensuring SPC and member countries can progressively expand coverage.
+
+```{r priority_points_text, results='asis'}
+# Context
+ctx <- paste0(
+  "**Context from the data.** Completeness is documented for ", fmt_int(k_comp), " indicators; ",
+  fmt_int(k_src1), " have a single source and ", fmt_int(k_srcM), " list multiple sources. ",
+  fmt_int(k_obl_m), " indicators are *Mandatory* or *Treaty-based*; ",
+  fmt_int(k_div3p), " involve three or more SPC divisions."
+)
+knitr::asis_output(paste0(ctx, "\n\n"))
+```
+
+```{r priority_points_top15_contrib, fig.width=12, fig.height=8}
+## ---------- Helpers (base R only) ----------
+if (!exists("ds_pick_col")) {
+  ds_pick_col <- function(nm, patterns){
+    for (pt in patterns){
+      i <- which(grepl(pt, nm, ignore.case = TRUE))[1]
+      if (!is.na(i)) return(nm[i])
+    }
+    NA_character_
+  }
+}
+if (!exists("ds_split_multi")) ds_split_multi <- function(x) {
+  if (is.null(x)) return(character(0))
+  v <- as.character(x); v[is.na(v)] <- ""
+  strsplit(v, "\\s*[,;|/]\\s*")
+}
+if (!exists("ds_norm")) ds_norm <- function(x) trimws(tolower(as.character(x)))
+if (!exists("ds_titlecase")) ds_titlecase <- function(x) gsub("(^|[[:space:]])([[:alpha:]])","\\1\\U\\2", tolower(as.character(x)), perl=TRUE)
+if (!exists("fmt_int")) fmt_int <- function(x) formatC(as.integer(x), format="d", big.mark=",")
+
+parse_percent <- function(x){
+  v <- suppressWarnings(as.numeric(x))
+  if (all(is.na(v))) v <- suppressWarnings(as.numeric(gsub("[^0-9.]+","", as.character(x))))
+  if (any(is.finite(v)) && max(v, na.rm = TRUE) <= 1.2) v <- v * 100
+  v
+}
+
+## ---------- Column detection ----------
+nm <- names(ind)
+col_indicator <- ds_pick_col(nm, c("^definition$","^indicator(_name|_title)?$", "^name$", "^title$"))
+if (is.na(col_indicator)) col_indicator <- ds_pick_col(nm, c("^id$","^code$"))
+
+col_overall   <- ds_pick_col(nm, c("^completeness$","overall.*complete","composite"))
+col_sources   <- ds_pick_col(nm, c("^data[ _-]?sources?$","^source$","^dtype$"))
+col_report    <- ds_pick_col(nm, c("^reporting[ _-]?obligations?$","^reporting$","^obligation$"))
+col_divs      <- ds_pick_col(nm, c("^spc[ _-]?divisions?$","^divisions?$"))
+col_planned   <- ds_pick_col(nm, c("will[ _-]?be[ _-]?done[ _-]?completely","^planned$","underway","in[ _-]?progress"))
+
+if (is.na(col_overall))        stop("No 'completeness' column found.")
+if (is.na(col_sources))        warning("No 'Data sources' column found; source-related points will be 0.")
+if (is.na(col_report))         warning("No 'Reporting obligations' column found; reporting points will be 0.")
+if (is.na(col_divs))           warning("No 'SPC divisions' column found; division points will be 0.")
+
+## ---------- Base vectors ----------
+n <- nrow(ind)
+indicator_lbl <- if (!is.na(col_indicator)) as.character(ind[[col_indicator]]) else paste("Indicator", seq_len(n))
+indicator_lbl[is.na(indicator_lbl) | indicator_lbl==""] <- paste("Indicator", seq_len(n))
+overall_pct   <- if (!is.na(col_overall)) parse_percent(ind[[col_overall]]) else rep(NA_real_, n)
+
+## ---------- Completeness points (0–4) ----------
+pts_compl <- pmax(0, pmin(4, 4 * (overall_pct/100)))
+
+## ---------- Data Source points (0–3) + bonuses ----------
+pts_source <- rep(0, n); bonus_svy <- rep(0, n); bonus_mon <- rep(0, n)
+if (!is.na(col_sources)) {
+  src_list <- lapply(ind[[col_sources]], ds_split_multi)
+  for (i in seq_len(n)) {
+    si <- ds_norm(src_list[[i]]); si <- si[si != ""]
+    if (length(si) == 1) pts_source[i] <- 3 else if (length(si) >= 2) pts_source[i] <- 2
+    if (any(grepl("survey",   si))) bonus_svy[i] <- 1
+    if (any(grepl("monitor",  si)) || any(grepl("map", si))) bonus_mon[i] <- 1
+  }
+}
+
+## ---------- Reporting obligation (0–3) ----------
+pts_report <- rep(0, n)
+if (!is.na(col_report)) {
+  ro <- ds_norm(ind[[col_report]])
+  pts_report[grepl("mandatory|treaty", ro)] <- 3
+  pts_report[grepl("country", ro)]          <- pmax(pts_report[grepl("country", ro)], 2)
+}
+
+## ---------- SPC divisions (0–3; +1 per division) ----------
+pts_divs <- rep(0, n)
+if (!is.na(col_divs)) {
+  dv_list <- lapply(ind[[col_divs]], ds_split_multi)
+  for (i in seq_len(n)) {
+    di <- unique(dv_list[[i]]); di <- di[!is.na(di) & di != ""]
+    pts_divs[i] <- pmin(3, length(di))
+  }
+}
+
+## ---------- Planned/underway -> zero out total ----------
+is_planned <- rep(FALSE, n)
+if (!is.na(col_planned)) {
+  v_chr <- ds_norm(ind[[col_planned]])
+  is_planned <- is.finite(as.numeric(v_chr)) & as.numeric(v_chr) > 0 |
+                (!is.na(v_chr) & v_chr != "" & !v_chr %in% c("no","0","false","n","na"))
+  is_planned[is.na(is_planned)] <- FALSE
+}
+
+## ---------- Component matrix & totals ----------
+comp_names <- c("Completeness", "Data source", "Reporting obligation",
+                "SPC divisions", "Survey bonus", "Monitoring/Mapping bonus")
+priority_components <- cbind(pts_compl, pts_source, pts_report, pts_divs, bonus_svy, bonus_mon)
+priority_components[is_planned, ] <- 0
+ScorePoints <- rowSums(priority_components, na.rm = TRUE)
+
+priority_df <- data.frame(Indicator = indicator_lbl, ScorePoints = ScorePoints, stringsAsFactors = FALSE)
+
+## ---------- Plot (compact legend + wrapped labels) ----------
+ord     <- order(-priority_df$ScorePoints)
+top_idx <- ord[seq_len(min(15, length(ord)))]
+M <- t(priority_components[top_idx, , drop = FALSE]); rownames(M) <- comp_names
+
+# wrap labels more aggressively
+wrap_lab <- function(s, w = 34) paste(strwrap(s, width = w), collapse = "\n")
+labs_raw <- priority_df$Indicator[top_idx]
+labs     <- vapply(labs_raw, wrap_lab, character(1), w = 45)
+
+# palette
+if (!exists("col_priority") || length(col_priority) < nrow(M)) {
+  col_priority <- c("#273f48", "#57a686", "#e9d77a", "#f3a15d", "#4d7ea8", "#e56b57")
+}
+cols <- col_priority[seq_len(nrow(M))]
+
+# adaptive left margin (bigger to ensure all lines show)
+# n_lines  <- vapply(strsplit(labs, "\n", fixed = TRUE), length, integer(1))
+# left_mar <- max(24, 12 + 2.8 * max(n_lines))
+cex_names <- 0.7
+
+old_par <- par(no.readonly = TRUE); on.exit(par(old_par), add = TRUE)
+layout(matrix(c(1,2), nrow = 2, byrow = TRUE), heights = c(0.2, 0.8))
+
+## Legend panel (compact, left-aligned)
+par(mar = c(0, 1, 1.2, 1), bty = "n")
+plot.new()
+legend("topright", legend = rownames(M), fill = cols, border = NA,
+       horiz = FALSE, ncol = 2, cex = 0.9, inset = c(0.01, 0.01),
+       x.intersp = 0.6, y.intersp = 0.9, xpd = NA, bty = "n")
+
+## Barplot panel
+par(mar = c(6, 13, 2.5, 2), bty = "n")
+barplot(M,
+        horiz = TRUE, las = 1,
+        names.arg = labs, cex.names = cex_names,
+        col = cols, border = NA,
+        xlab = "Score",                   # keep your shorter label if you prefer
+        main = "Top 15 indicators — component contributions")
+```
+
+```{r priority_points_takeaways, results='asis'}
+# Natural-language takeaways focused on the new scoring
+top_name <- priority_df$Indicator[order(-priority_df$ScorePoints)][1]
+top_pts  <- max(priority_df$ScorePoints, na.rm = TRUE)
+# Which component dominates on average?
+avg_comp <- colMeans(priority_components, na.rm = TRUE)
+names(avg_comp) <- c("Completeness", "Source count", "Report obligation", "SPC Division count", "Survey", "Monitoring")
+dom_comp <- names(avg_comp)[which.max(avg_comp)]
+knitr::asis_output(paste0(
+  "**Takeaways.** **", ds_trunc(top_name, 80), "** currently ranks first at **", fmt_int(top_pts),
+  " point(s)**. Across the portfolio, the **", dom_comp, "** contributes the most points on average.\n\n"
+))
+```
+
+# Annex
+## Tables of indicators with strong overlap
+```{r top_overlaps}
+make_indicator_overlap_table <- function(fw_mat, n_top = 25){
+  if (is.null(fw_mat) || ncol(fw_mat) == 0) return(NULL)
+  
+  def_col <- grep("defin|indicator", names(ind), value = TRUE)[1]
+  if (is.na(def_col)) def_col <- names(ind)[1]
+  
+  subtopic_col <- if ("subtopic" %in% names(ind)) "subtopic" else NA
+  
+  counts <- rowSums(fw_mat == 1, na.rm = TRUE)
+  ord    <- order(counts, decreasing = TRUE)
+  keep   <- head(ord, n_top)
+  
+  rows <- lapply(keep, function(i){
+    row_vals <- as.numeric(as.matrix(fw_mat[i, , drop = FALSE]))
+    fwks     <- colnames(fw_mat)[which(row_vals > 0)]
+    
+    fwks_str <- if (length(fwks) == 0) "" else paste(fw_label(fwks), collapse = "; ")
+    if (fwks_str == "" && length(fwks) > 0) fwks_str <- paste(fwks, collapse = "; ")
+    
+    def <- ind[[def_col]][i]; if (length(def) == 0 || is.na(def)) def <- ""
+    sub <- if (!is.na(subtopic_col)) ind[[subtopic_col]][i] else ""
+    if (length(sub) == 0 || is.na(sub)) sub <- ""
+    
+    data.frame(
+      Subtopic   = sub,
+      Indicator  = def,
+      Count      = counts[i],
+      Frameworks = fwks_str,
+      stringsAsFactors = FALSE
+    )
+  })
+  
+  if (length(rows) == 0) return(NULL)
+  out <- do.call(rbind, rows)
+  rownames(out) <- NULL
+  out
+}
+
+# Tables
+tab_strict <- make_indicator_overlap_table(fw_strict, n_top = 25)
+tab_loose  <- make_indicator_overlap_table(fw_loose,  n_top = 25)
+
+if (!is.null(tab_strict))
+  knitr::kable(tab_strict, caption = "Top 25 indicators with highest strict overlaps")
+
+if (!is.null(tab_loose))
+  knitr::kable(tab_loose,  caption = "Top 25 indicators with highest loose overlaps")
+
+```
+## Table of most complete indicators {#table-completeness}
+```{r top_completeness}
+make_completeness_table <- function(ind, n_top = 25){
+  comp_col <- "completeness"
+  excl_col <- "will_be_done_completely"
+  sub_col  <- "subtopic"
+  def_col  <- "definition"
+  
+  # Exclude rows where 'will_be_done_completely' is not NA/empty
+  excl <- ind[[excl_col]]
+  keep_mask <- is.na(excl) | trimws(as.character(excl)) == ""
+  
+  # Parse completeness as numeric
+  comp_vals <- suppressWarnings(as.numeric(gsub("[^0-9.]", "", ind[[comp_col]])))
+  comp_vals[!keep_mask] <- NA
+  
+  # Order
+  ord <- order(comp_vals, decreasing = TRUE, na.last = NA)
+  keep <- head(ord, n_top)
+  if (length(keep) == 0) return(NULL)
+  
+  out <- data.frame(
+    Subtopic     = ind[[sub_col]][keep],
+    Definition   = ind[[def_col]][keep],
+    Completeness = round(comp_vals[keep]),
+    stringsAsFactors = FALSE
+  )
+  rownames(out) <- NULL
+  out
+}
+
+# Build and show
+tab_completeness <- make_completeness_table(ind, n_top = 30)
+
+if (!is.null(tab_completeness)) {
+  knitr::kable(tab_completeness,
+               caption = "Top 30 indicators by completeness (excluding those that will be done for sure) \n\n Goal: 10 years long time series")
+}
+
+```
